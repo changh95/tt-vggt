@@ -1,0 +1,24 @@
+# ---- machine-local state ----
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.omc/
+.claude/
+
+# ---- benchmark / eval artefacts ----
+run.log
+*.log
+/tmp/*
+
+# ---- datasets + weights (too big for git) ----
+co3d_data/
+*.safetensors
+*.ckpt
+*.pt
+*.tar.gz
+*.zip
+
+# ---- reference code cloned separately ----
+vggt_ref/
+tt-metal/
