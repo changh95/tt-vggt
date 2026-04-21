@@ -98,26 +98,9 @@ python3 eval_vggt.py --num-views 2 --category apple --co3d-root co3d_data
 
 See `co3d_eval_results.md` for the full write-up.
 
-## Performance benchmark
+## Precision profile
 
-Best-of-3 `latency_ms` at B=1 S=1 518×518. Full trajectory in
-`results.tsv`; this table shows the keep-commits only.
-
-| step | commit | op(s) on device | latency | fps | vs baseline | min PCC |
-|---|---|---|---:|---:|---:|---:|
-| initial port scaffolding | c7d238e | — (CPU passthrough) | — | — | — | — |
-| CPU reference run | f718b74 | — | **5037 ms** | 0.1985 | — | 1.000 |
-| MLP port (72 instances) | 185868f | fc1 + gelu + fc2 bf16 LoFi | 3122 ms | 0.3203 | +61 % | 0.9948 |
-| attn qkv bf16 | b311533 | + attn qkv | 2669 ms | 0.3746 | +89 % | 0.9930 |
-| attn proj HiFi4 + fp32 dest | 0a04e6f | + attn proj (precision fix) | 2495 ms | 0.4008 | +102 % | 0.9955 |
-| attn scores/softmax on device | 53d46c1 | + Q·Kᵀ, softmax, ·V (fp32) | 2232 ms | 0.4481 | +126 % | 0.9943 |
-| fuse norm1 into attn | 9c7d71a | + Block.norm1 | 2193 ms | 0.4559 | +130 % | 0.9955 |
-| keep qkv in bf16 through CPU | a86d4aa | no new op, no fp32 roundtrip | 2067 ms | 0.4837 | +144 % | 0.9946 |
-| full on-device Block | 8969cef | + q_norm, k_norm, ls1, ls2, norm2, residual adds | 1712 ms | 0.5841 | +194 % | 0.9961 |
-| 2D RoPE on device | bae1d60 | + cos/sin + rotate_half + mul/add | 1640 ms | 0.6097 | +207 % | 0.9957 |
-| DPT output_conv2 on device | db0ff6a | + 3×3 128→32 + relu + 1×1 at 518×518 | ~1694 ms | 0.59 | +196 % | 0.9959 |
-
-Precision profile across the port (preserved through every commit):
+Preserved unchanged through every keep commit below:
 
 - bf16 weights, bf16 matmul inputs.
 - fp32 residual accumulator inside each Block (proj/fc2 output
@@ -179,52 +162,58 @@ a ttnn kernel-compile-on-first-new-shape stall at S>2 (documented in
 `TODO.md` as BF0). S=2 / 3 pairs is statistically coarse but was enough
 to measure the port's bf16+HiFi4 cost against the reference.
 
-## Optimization trajectory — what worked and what didn't
+## Optimization trajectory
 
-The `results.tsv` log has a row for every experiment (31 total).
-Condensed themes:
+Every row an experiment run on the p150a. `keep` means the commit landed
+on `changh95/vggt`; `discard` means it was reverted or never merged.
+Latency is best-of-3 `latency_ms` at B=1 S=1 518×518. Full log with
+every noise-level experiment in `results.tsv`.
 
-**Worked (kept):** op-by-op device ports where every new device op was
-paired with a correctness check (`status: PASS` ≡ min PCC ≥ 0.99). The
-wins that actually moved latency were the big matmul-heavy ops: MLP,
-attn qkv, attn proj, the Q·Kᵀ → softmax → ·V chain, and finally the
-full-block fusion that kept the residual stream on chip. DPT
-`output_conv2` moved CPU work to device at ~break-even wall-clock.
+| # | commit | status | change | ms | fps | min PCC | note |
+|---|---|---|---|---:|---:|---:|---|
+| 1 | c7d238e | keep | scaffolding | — | — | — | empty stubs |
+| 2 | f718b74 | keep | CPU passthrough baseline | 5037 | 0.1985 | 1.0000 | reference |
+| 3 | f718b74 | discard | `torch.set_num_threads(16)` | 7064 | 0.1416 | 1.0000 | HT oversubscription |
+| 4 | 185868f | **keep** | port MLP (72× fc1+gelu+fc2 bf16) | 3122 | 0.3203 | 0.9948 | +61 % |
+| 5 | 185868f | discard | port every `nn.Linear` | — | 0.2898 | 0.986 | tiny head linears: overhead + precision |
+| 6 | 185868f | discard | MLP + attn qkv + proj (bf16 proj) | — | 0.4028 | 0.988 | bf16 proj breaks conf |
+| 7 | b311533 | **keep** | attn qkv on ttnn (proj stays CPU) | 2669 | 0.3746 | 0.9930 | +17 % |
+| 8 | b311533 | discard | standalone `Block.norm1/2` LN on device | +100 | 0.3608 | 0.9944 | LN compute < round-trip |
+| 9 | 0a04e6f | **keep** | attn proj, HiFi4 + fp32 dest | 2495 | 0.4008 | 0.9955 | HiFi4 restored proj precision |
+| 10 | 0a04e6f | discard | top-level bf16 autocast | — | 0.4272 | **0.0000** | heads need fp32 tokens |
+| 11 | 0a04e6f | discard | fused `ttnn.SDPA` (LoFi) | — | 0.4341 | 0.979 | kernel precision loss |
+| 12 | 0a04e6f | discard | fused `ttnn.SDPA` (HiFi4) | — | 0.4932 | **0.572** | likely ttnn shape bug for non-causal 1374 |
+| 13 | 0a04e6f | discard | manual Q·Kᵀ+softmax+·V all bf16 on device | — | 0.4615 | 0.979 | bf16 softmax precision |
+| 14 | 53d46c1 | **keep** | full attention on device, fp32 scores+softmax | 2232 | 0.4481 | 0.9943 | +12 % |
+| 15 | 53d46c1 | discard | `nlp_create_qkv_heads` split, keep V on device | 2232 | 0.4481 | 0.9943 | break-even |
+| 16 | 9c7d71a | **keep** | fuse `Block.norm1` into attn on device | 2193 | 0.4559 | 0.9955 | +2 % |
+| 17 | a86d4aa | **keep** | keep qkv bf16 through CPU path (skip fp32 cast) | 2067 | 0.4837 | 0.9946 | +6 % |
+| 18 | a86d4aa | discard | `torch.set_num_threads(4)` | 2428 | 0.4119 | 0.9946 | CPU glue benefits from more threads |
+| 19 | ffd157c | discard | bf16 autocast over `DPTHead.forward` | — | 0.5393 | **0.0000** | `expp1` conf activation too sensitive |
+| 20 | ffd157c | discard | DPT `norm` + `projects` 1×1 on device | 2131 | 0.4691 | 0.9957 | prelude too small for roundtrip |
+| 21 | 8969cef | **keep** | full on-device Block (norm1, qkv, qk_norm, scores/softmax/ctx, merge_heads, proj, ls1, add, norm2, fc1+gelu+fc2, ls2, add) | 1712 | 0.5841 | 0.9961 | +194 %, biggest single step |
+| 22 | bae1d60 | **keep** | 2D RoPE on device (cos/sin tables + rotate_half + mul/add) | 1640 | 0.6097 | 0.9957 | +207 %, q/k no longer leave chip |
+| 23 | db0ff6a | **keep** | DPT `output_conv2` (3×3 → relu → 1×1 at 518×518) on `ttnn.conv2d` | ~1694 | 0.5900 | 0.9959 | break-even wall-clock; ~454 ms CPU → device |
+| 24 | db0ff6a | discard | per-conv wrapper for DPT `scratch_forward` | 1895 | 0.5276 | 0.9960 | 120× up/down round-trips dominate |
+| 25 | 2b2bf2d | discard | device-native `scratch_forward` refinenets | 1418 | 0.7053 | **−0.0754** | ttnn layout-chaining bug; fix via mast3r helpers (see TODO) |
 
-**Didn't work, discarded:** CPU tricks masquerading as device work
-(generic bf16 autocast) — broke the conf heads' PCC. Individual
-LayerNorm ports — overhead exceeded compute. `ttnn.transformer.
-scaled_dot_product_attention` fused kernel — PCC collapse to 0.57 on
-this model's 1374-token non-causal attention (possible ttnn bug at this
-shape). Per-conv wrapper on the DPT scratch_forward — 120 individual
-up/down round-trips added 255 ms. Device-native scratch_forward —
-partially implemented but broke PCC to -0.08 due to ttnn layout-chaining
-between conv2d / linear / upsample / add; blocked until I replicate
-mast3r's proven layout helpers.
+**Principles extracted from this trajectory:**
 
-**Bigger principles observed, in hindsight:**
-
-- **Always validate against a real reference, not the previous port.** The
-  `eval_vggt.py` harness loads a *fresh un-patched* VGGT instance
-  alongside the ported one; otherwise the "reference" is just the port
-  comparing against itself, and every experiment looks like PCC 1.0.
-- **Precision budget is per-port, not per-model.** Adding one more bf16
-  op is OK until it isn't; I blew past 0.99 twice by moving ops whose
-  individual error was small but cumulative damage over 48 aggregator
-  blocks collapsed the confidence head. Fix was targeted — fp32
-  intermediates only where numerically hot (residual accumulator,
-  softmax), not everywhere.
-- **Host↔device round-trip cost dominates small ops.** Most "this
-  should be faster on the chip" experiments that targeted tiny ops
-  (Block.norm1 alone, tiny head linears, single 1×1 convs) came out
-  break-even or slower because 72 × (upload + download) per forward
-  ate the device compute gain. The wins came from batching device ops
-  end-to-end in fused functions that upload once, compute many ops on
-  chip, and download once.
-- **ttnn precision knobs matter more than which op you port.** HiFi4 +
-  `fp32_dest_acc_en` + `packer_l1_acc` on precision-hot matmuls
-  recovered PCC budget that pure bf16 had spent. Without it, the attn
-  proj port was FAIL (0.988); with it, the same port was PASS (0.996).
+- **Always validate against a *fresh un-patched* reference.**
+  `eval_vggt.py` loads a separate VGGT instance; otherwise the port
+  compares against itself and every experiment looks like PCC 1.0.
+- **Precision budget is cumulative, not per-op.** Each bf16 op was fine
+  alone but stacking them blew the 0.99 conf-head floor twice. Targeted
+  fp32 intermediates (residual accumulator, softmax) recovered the
+  budget without paying fp32's bandwidth cost globally.
+- **Host↔device round-trip beats compute for small ops.** LayerNorm
+  alone, prelude 1×1 convs, per-conv wrappers — all net-negative
+  because 72 × (upload + download) per forward outruns the chip's
+  compute savings. The wins came from fused functions that upload once,
+  compute many ops, download once.
+- **`MathFidelity.HiFi4` + `fp32_dest_acc_en` on precision-hot matmuls**
+  is the cheapest precision lever. It flipped the attn proj port from
+  FAIL (0.988) to PASS (0.996) without changing wall-clock.
 
 ## Known limitations
 
