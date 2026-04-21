@@ -93,16 +93,22 @@ def main():
 
     fig = plt.figure(figsize=(5.6, 5.6), dpi=120)
     ax = fig.add_subplot(111, projection="3d")
-    ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=colors, s=0.6, marker=".")
-    # Rotate the virtual camera well away from the capture viewpoint.
-    ax.view_init(elev=15, azim=-60)
+    # VGGT world_points use OpenCV convention (x-right, y-down, z-forward).
+    # Remap so plot-up is world-up: plot(X, Z, -Y).
+    plot_x = pts[:, 0]
+    plot_y = pts[:, 2]   # depth -> plot's into-the-page direction
+    plot_z = -pts[:, 1]  # -Y -> plot-up
+    ax.scatter(plot_x, plot_y, plot_z, c=colors, s=0.6, marker=".")
+    # Rotate the virtual camera slightly off the capture viewpoint.
+    ax.view_init(elev=15, azim=-15)
     ax.set_axis_off()
-    # Equal aspect roughly by setting box limits from percentile range.
+    # Trim to the 2..98 percentile box so outliers don't squash the frame.
     for setter, arr in (
-        (ax.set_xlim, pts[:, 0]), (ax.set_ylim, pts[:, 1]), (ax.set_zlim, pts[:, 2]),
+        (ax.set_xlim, plot_x), (ax.set_ylim, plot_y), (ax.set_zlim, plot_z),
     ):
         lo, hi = np.quantile(arr, [0.02, 0.98])
         setter(lo, hi)
+    ax.set_box_aspect((1, 1, 1))
     fig.tight_layout(pad=0)
     fig.savefig(media_dir / "point_cloud_reprojected.png",
                 bbox_inches="tight", pad_inches=0)
