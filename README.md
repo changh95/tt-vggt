@@ -1,9 +1,7 @@
 # tt-vggt
 
-VGGT-1B (Meta, `facebookresearch/vggt`) running on a single Tenstorrent
-Blackhole p150a via `tt-nn` / `tt-metallium`. This repo holds the port
-code, benchmark + evaluation harnesses, and the full optimization
-trajectory — not the upstream model code and not the tt-metal SDK.
+VGGT-1B (`facebookresearch/vggt`) on a single Tenstorrent Blackhole
+p150a via `tt-nn` / `tt-metallium`.
 
 ## Results at a glance
 
@@ -11,48 +9,24 @@ trajectory — not the upstream model code and not the tt-metal SDK.
 |---|---|---|---|
 | latency / frame (B=1 S=1 518×518) | 5037 ms | **~1694 ms** | **2.97×** |
 | throughput | 0.1985 fps | **0.59 fps** | **+196 %** |
-| min-PCC (port vs torch ref, synthetic rand input) | — | 0.9959 | — |
-| min-PCC (port vs torch ref, real CO3Dv2 apple images) | — | **0.9947** | — |
-| AUC@30° (pair-wise pose, CO3Dv2 apple S=2, 3 scenes) | 87.2 | **86.1** | Δ −1.1 |
-
-The port moves every transformer block, RoPE, and the final DPT
-`output_conv2` conv stack to the p150a. The remaining CPU work (DPT
-refinenets, DPT prelude, `custom_interpolate`, `activate_head`, image
-normalization) is why this is 3× instead of fully device-bound.
+| min-PCC (port vs ref, synthetic input) | — | 0.9959 | — |
+| min-PCC (port vs ref, real CO3Dv2 apple) | — | **0.9947** | — |
+| AUC@30° (CO3Dv2 apple S=2, 3 scenes) | 87.2 | **86.1** | Δ −1.1 |
 
 ## Repository layout
 
 ```
 tt-vggt/
-├── README.md                # this file
-├── PROGRAM.md               # original problem brief
+├── README.md
 ├── TODO.md                  # future bug-fix + optimization plan
 ├── co3d_eval_results.md     # detailed CO3Dv2 eval write-up
-├── results.tsv              # one row per experiment (keep/discard)
+├── results.tsv              # one row per experiment
 ├── test_vggt.py             # perf benchmark harness (B=1 S=1)
 ├── eval_vggt.py             # CO3Dv2 correctness harness (PCC + GT pose)
-└── models/
-    └── demos/
-        └── vggt/
-            ├── reference/
-            │   └── torch_vggt.py    # thin loader over facebookresearch/vggt
-            └── tt/
-                └── ttnn_vggt.py     # monkey-patches Block / Mlp / DPT on device
+└── models/demos/vggt/
+    ├── reference/torch_vggt.py    # loader over facebookresearch/vggt
+    └── tt/ttnn_vggt.py            # ttnn port
 ```
-
-## Hardware / software environment
-
-- **Hardware**: Tenstorrent Blackhole p150a (single chip on a 2× p300c
-  host, 4 chips total, chip 0 used).
-- **Tenstorrent SDK**: `tt-metal` (Tracy profiler enabled) + `tt-nn`
-  Python bindings. Both taken from the sibling `medgemma/tt-metal` build
-  via `sys.path` shim at the top of `test_vggt.py` / `eval_vggt.py` —
-  the machine's venv-pinned `ttnn` points at a scrubbed pi0_5 checkout
-  without matching kernel sources, so we reuse the medgemma tree.
-- **Reference model**: `facebookresearch/vggt`, cloned into
-  `vggt_ref/` (outside this repo, see `.gitignore`). Weights from HF
-  `facebook/VGGT-1B` (≈3.6 GB safetensors, in HF cache).
-- **Venv**: `~/.tenstorrent-venv`.
 
 ## How to reproduce
 
