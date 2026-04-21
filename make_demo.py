@@ -100,7 +100,7 @@ def main():
     plot_z = -pts[:, 1]  # -Y -> plot-up
     ax.scatter(plot_x, plot_y, plot_z, c=colors, s=0.6, marker=".")
     # Rotate the virtual camera slightly off the capture viewpoint.
-    ax.view_init(elev=15, azim=-15)
+    ax.view_init(elev=5, azim=-15)
     ax.set_axis_off()
     # Trim to the 2..98 percentile box so outliers don't squash the frame.
     for setter, arr in (
