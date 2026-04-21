@@ -13,6 +13,22 @@ p150a via `tt-nn` / `tt-metallium`.
 | min-PCC (port vs ref, real CO3Dv2 apple) | — | **0.9947** | — |
 | AUC@30° (CO3Dv2 apple S=2, 3 scenes) | 87.2 | **86.1** | Δ −1.1 |
 
+## Demos
+
+Single-image inference on `vggt_ref/examples/kitchen/images/00.png` via
+`make_demo.py`. Depth map and re-rendered point cloud are both produced
+from the ttnn port's `depth` and `world_points` outputs.
+
+| input | predicted depth | point cloud, rendered from a new angle |
+|---|---|---|
+| ![input](media/input.png) | ![depth](media/depth.png) | ![point cloud](media/point_cloud_reprojected.png) |
+
+Reproduce with:
+
+```bash
+python3 make_demo.py
+```
+
 ## Repository layout
 
 ```
@@ -23,6 +39,8 @@ tt-vggt/
 ├── results.tsv              # one row per experiment
 ├── test_vggt.py             # perf benchmark harness (B=1 S=1)
 ├── eval_vggt.py             # CO3Dv2 correctness harness (PCC + GT pose)
+├── make_demo.py             # populates media/ with input + depth + point cloud
+├── media/                   # demo input + output images
 └── models/demos/vggt/
     ├── reference/torch_vggt.py    # loader over facebookresearch/vggt
     └── tt/ttnn_vggt.py            # ttnn port
