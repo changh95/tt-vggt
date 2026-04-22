@@ -35,30 +35,35 @@ S=1 primed the program cache for ~1374-token shapes; S=3 introduces ~4122
 first-time. Compile per new shape is seconds-to-tens-of-seconds; cumulative
 compile time blows up.
 
-Candidate fixes — **option 1 has been attempted and ruled out:**
+Candidate fixes — **options 1 and 2 partially landed; neither unblocks
+S>2 alone:**
 
-1. ~~**Pre-warm at install time.**~~ **Tried and does not work.**
-   `_prewarm_seqs(model, device, (1,2,4,8))` was added to
-   `_ensure_installed` and verified: S=1 prewarm 2.0 s / PCC 0.9959;
-   S=2 prewarm 3.3 s / PCC 0.9981; **S=4 prewarm hangs 40+ min at 99%
-   CPU** with zero log progress after device open. Python `SIGTERM`
-   never fires (handler can't run while ttnn is in a deep C++ compile
-   call), so recovery requires `SIGKILL`, which wedges the chip. The
-   "prewarm" call is still exercised by test_vggt.py / eval_vggt.py but
-   is clamped to `S ≤ 2` by default; pass `--prewarm-seqs` to opt in.
-2. **Pad to a canonical S.** Always pass `S=S_max` (say 8) to the
-   aggregator and mask out unused frames. Only one shape set ever hits
-   the program cache. Needs attention-mask plumbing in
-   `Aggregator.forward` (global attention: prevent padding frames from
-   contributing to real ones) and result-slice to trim the output back
-   to the requested S. **Current recommendation — implement this next.**
+1. ~~**Pre-warm at install time.**~~ **Ruled out.** S=4 prewarm hangs
+   40+ min with no progress; same compile stall, just relocated to
+   install time. Scaffolding still in `_ensure_installed(prewarm_seqs=...)`,
+   clamped to S≤2 by default.
+2. **Pad to a canonical S.** ✅ Infrastructure landed —
+   `_install_ttnn_aggregator_padding` + module-level
+   `_ACTIVE_GLOBAL_MASK` + tt_block_forward mask path. Set
+   `VGGT_S_CANON=N` to pin shapes at N. Replicates the last real
+   frame and masks global-attention key positions for padded frames
+   with `-inf`. Outputs sliced back to real S. **Validated at
+   `VGGT_S_CANON=2, S_real=1`: PCC 0.9957, same as un-padded S=1.**
+   But: **`VGGT_S_CANON=4` still hangs on the first forward (40+ min
+   timeout)** — the padding correctly pins shapes for subsequent
+   calls but the very first compile at the new shape set is the
+   slow thing, not the existence of multiple shapes. So option 2
+   alone doesn't unblock S>2 — it only helps if S_canon is
+   S-values that already compile cheaply (1 or 2).
 3. **mast3r-style pre-computed `MatmulMultiCoreReuseMultiCastProgramConfig`.**
-   Pin matmul shard strategies manually so the auto-discovery compile path
-   (which is what's actually slow) is bypassed. Most invasive. Needed
-   anyway for further perf tuning; can be staged after option 2.
+   Pin matmul shard strategies manually so the auto-discovery compile
+   path (which is what's actually slow — not shape-cache lookup) is
+   bypassed. Most invasive. **This is the next attack** — option 2's
+   infrastructure is ready to stack on top as soon as option 3 gets
+   the matmul compile time down from pathological to tens of seconds.
 
-Until BF0 is fixed, evaluation is stuck at S=2 / 1 pair per scene (coarse
-but functional — see `co3d_eval_results.md`).
+Until option 3 lands, evaluation is stuck at S=2 / 1 pair per scene
+(coarse but functional — see `co3d_eval_results.md`).
 
 ### BF1 — Hard-kill corrupts the device mesh
 

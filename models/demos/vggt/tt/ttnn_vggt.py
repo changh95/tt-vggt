@@ -51,6 +51,13 @@ _CACHED_MODEL = None
 _INSTALL_DONE: dict = {}
 _HIFI_KCONFIG = None
 
+# BF0 option 2 state: pad S to a canonical size so ttnn program-cache only
+# ever sees one set of shapes. When padding is active, global attention
+# needs an additive mask with -inf on the padding frames' key positions.
+# Set by the Aggregator patch right before the forward; cleared after.
+_ACTIVE_GLOBAL_MASK = None
+_PATCH_COUNT = None  # P = patches + special tokens (1374 for VGGT @ 518x518 patch=14)
+
 
 def _get_model():
     global _CACHED_MODEL
@@ -348,6 +355,14 @@ def _install_ttnn_block(model, device):
         # stability over the 1374-long row (bf16 collapsed conf PCC).
         tt_scores = ttnn.matmul(tt_q, tt_kt, compute_kernel_config=kcfg, dtype=ttnn.float32)
         tt_scores = ttnn.multiply(tt_scores, 1.0 / math.sqrt(Dh))
+        # BF0 option 2: pad-to-canonical-S with attention mask. When the
+        # Aggregator wrapper has padded input frames, it publishes an
+        # additive global-attention mask (-inf on padding-frame key
+        # positions). Apply only to the aggregator's global-attention
+        # blocks, detected via N > _PATCH_COUNT (P=1374). Frame-attn N==P,
+        # camera-trunk attn N=5 — neither gets the mask.
+        if _ACTIVE_GLOBAL_MASK is not None and _PATCH_COUNT is not None and N > _PATCH_COUNT:
+            tt_scores = ttnn.add(tt_scores, _ACTIVE_GLOBAL_MASK)
         tt_attn = ttnn.softmax(tt_scores, dim=-1, compute_kernel_config=kcfg)
         # Context: match the precision profile of the working (non-fused)
         # attention — fp32 intermediate then back to bf16 for the proj
@@ -916,11 +931,120 @@ def _prewarm_seqs(model, device, seqs, img_size: int = 518):
         print(f"[vggt] prewarm S={S}: {time.perf_counter() - t0:.1f}s")
 
 
-def _ensure_installed(device, prewarm_seqs=(1,)):
+def _install_ttnn_aggregator_padding(model, device, s_canon: int):
+    """Patch Aggregator.forward to always run at S=s_canon. BF0 option 2.
+
+    ttnn program-cache keys on (shape, layout, memory_config). Global
+    attention in the VGGT aggregator sees N = S × P (P=1374 @ 518×518).
+    A fresh S introduces an untold number of new compile shapes that
+    cumulatively hang for 20+ min. By always running at a single s_canon
+    the program cache only ever sees one set of shapes, so the hang is
+    paid once at install time.
+
+    Padding strategy: replicate the last real frame to fill up to s_canon
+    so patch_embed + layer_norm remain numerically sensible. Global
+    attention is masked so real frames do not attend to padded key
+    positions (see _ACTIVE_GLOBAL_MASK wiring in tt_block_forward).
+    Frame attention is per-frame so the padding frames produce their own
+    outputs that we then slice away.
+
+    Outputs are sliced back to the caller's real S before return.
+    """
+    import ttnn
+    from vggt.models.aggregator import Aggregator  # type: ignore
+    import torch.nn as nn
+
+    global _PATCH_COUNT
+    # Infer P (patches + special tokens). 518/14=37 → 37*37=1369 patches,
+    # + patch_start_idx (1 camera + 4 register tokens) = 1374.
+    # This is invariant for VGGT's fixed 518 input size.
+    for m in model.modules():
+        if isinstance(m, Aggregator):
+            aggregator = m
+            break
+    else:
+        raise RuntimeError("No Aggregator found in model")
+
+    num_patches = (518 // aggregator.patch_size) ** 2
+    P = num_patches + aggregator.patch_start_idx
+    _PATCH_COUNT = P
+    aggregator._tt_device = device
+    aggregator._tt_s_canon = s_canon
+
+    # Precompute the additive global-attention mask shape (1, 1, 1, S*P):
+    # 0 for valid token positions, -inf for padding. Broadcasts over batch,
+    # heads, and query dim. We hold one mask per (s_canon, S_real) pair;
+    # built on demand.
+    aggregator._tt_mask_cache = {}
+
+    def _mask_for(S_real: int):
+        key = (s_canon, S_real)
+        cached = aggregator._tt_mask_cache.get(key)
+        if cached is not None:
+            return cached
+        total = s_canon * P
+        # fp32 on host to preserve -inf correctly across the cast.
+        m = torch.zeros(1, 1, 1, total, dtype=torch.float32)
+        m[..., S_real * P:] = float("-inf")
+        # Upload as fp32 tile (tt_scores is fp32 at this point — see
+        # tt_block_forward). Shape broadcasts across (B, H, N_q, N_k).
+        tt_m = ttnn.from_torch(m, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+        aggregator._tt_mask_cache[key] = tt_m
+        return tt_m
+
+    if getattr(Aggregator, "_tt_padding_patched", False):
+        Aggregator._tt_s_canon = s_canon
+        return
+
+    orig_forward = Aggregator.forward
+
+    def padded_forward(self, images):
+        global _ACTIVE_GLOBAL_MASK
+        B, S_real, Ci, H, W = images.shape
+        S_canon = getattr(self, "_tt_s_canon", S_real)
+        if S_real == S_canon:
+            # No padding needed.
+            return orig_forward(self, images)
+        if S_real > S_canon:
+            raise RuntimeError(
+                f"S_real={S_real} exceeds the canonical S={S_canon} that was "
+                f"prewarmed at install. Set VGGT_S_CANON to a larger value "
+                f"(e.g. {max(4, S_real)}) and pay the extra install-time compile."
+            )
+        # Pad by replicating the last real frame.
+        pad_count = S_canon - S_real
+        last = images[:, -1:].contiguous()
+        padding = last.expand(B, pad_count, Ci, H, W)
+        images_padded = torch.cat([images, padding], dim=1).contiguous()
+
+        _ACTIVE_GLOBAL_MASK = _mask_for(S_real)
+        try:
+            output_list, patch_start_idx = orig_forward(self, images_padded)
+        finally:
+            _ACTIVE_GLOBAL_MASK = None
+        # Slice outputs [B, S_canon, P, 2C] → [B, S_real, P, 2C].
+        output_list = [o[:, :S_real].contiguous() for o in output_list]
+        return output_list, patch_start_idx
+
+    Aggregator.forward = padded_forward
+    Aggregator._tt_padding_patched = True
+
+
+def _ensure_installed(device, prewarm_seqs=(1,), s_canon: Optional[int] = None):
     if _INSTALL_DONE.get(id(device)):
         return
     import os
     model = _get_model()
+
+    # BF0 option 2: pad-to-canonical-S. Set VGGT_S_CANON (or pass
+    # s_canon=N explicitly) to run the aggregator at S=N always,
+    # padding short inputs + masking global-attn. This pins the
+    # ttnn program-cache to one set of shapes, avoiding the 20+ min
+    # first-forward compile stall at each new S. Default: no padding
+    # (s_canon=1) — preserves known-good S=1 / S=2 path.
+    if s_canon is None:
+        s_canon = int(os.environ.get("VGGT_S_CANON", "1") or "1")
+
     # RoPE tables must exist before the block patch reads them.
     _install_ttnn_rope_tables(model, device)
     _install_ttnn_block(model, device)
@@ -932,9 +1056,14 @@ def _ensure_installed(device, prewarm_seqs=(1,)):
     if os.environ.get("VGGT_TT_SCRATCH", "1") not in ("", "0"):
         _install_ttnn_dpt_scratch(model, device)
     _install_ttnn_dpt_output_conv2(model, device)
+    if s_canon > 1:
+        _install_ttnn_aggregator_padding(model, device, s_canon)
     _INSTALL_DONE[id(device)] = True
     if prewarm_seqs:
-        _prewarm_seqs(model, device, prewarm_seqs)
+        # When padding is active, all real forwards run at S=s_canon, so
+        # prewarm only at s_canon (ignore the legacy per-S warmups).
+        prewarm_actual = (s_canon,) if s_canon > 1 else prewarm_seqs
+        _prewarm_seqs(model, device, prewarm_actual)
 
 
 def vggt_forward(images: torch.Tensor, device: Any = None,
