@@ -146,14 +146,23 @@ final add:
 - Forcing TILE↔ROW_MAJOR layouts, `ttnn.sharded_to_interleaved`,
   `ttnn.to_memory_config(DRAM_MEMORY_CONFIG)`, `ttnn.synchronize_device`
   between ops, and `ttnn.clone(tt_x)` **all fail** to preserve `tt_l4`.
-- The **only** workaround that gives PCC 1.0 on the add is re-uploading
-  from a host-side copy (`_upload_nchw_as_flat(layer_4_rn_host, dev)`),
+- The **only** workaround that gives PCC 1.0 on the add in the probe
+  harness is re-uploading from a host-side copy of the *host-computed*
+  value (`layer_4_rn_host` from torch, not `ttnn.to_torch(tt_l4)`),
   which proves the corruption is in the original device buffer itself,
   not in Python bookkeeping.
-- Even pulling `tt_l4` to host inside `_resconv` via `ttnn.to_torch(tt_x)`
-  at the start and doing the residual add on host doesn't recover PCC —
-  suggesting the corruption has already happened by the time `_resconv`'s
-  first line runs, or `ttnn.to_torch` itself is not a snapshot.
+- Disabling the program cache via `VGGT_NO_PROGRAM_CACHE=1` (calling
+  `device.enable_program_cache()` is skipped) does **not** help —
+  end-to-end PCC stays broken. Rules out program-cache-driven reuse.
+- Pulling `tt_l4` to host inside `_resconv` via `ttnn.to_torch(tt_x)`
+  at the top + `synchronize_device` + `from_torch` re-upload and doing
+  the add on the fresh buffer **still** gives the same bad end-to-end
+  PCC. Either the device→host copy itself is incomplete (stale read)
+  or the fresh-upload buffer gets aliased too.
+- Even a full host-side add (`host_x + host_c2` → re-upload) gives
+  the same bad PCC, confirming the downstream pipeline is consuming
+  a corrupt residual-path output regardless of how the residual is
+  combined.
 
 ### Next debug steps (assume ttnn ≥ tt-metal-level understanding)
 

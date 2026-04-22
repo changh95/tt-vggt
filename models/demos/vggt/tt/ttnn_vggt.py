@@ -569,10 +569,14 @@ def _install_ttnn_dpt_scratch(model, device):
         return tt_x
 
     def _resconv(tt_x, w, prefix, ch, B, H, W, dev):
-        # The "canonical" mast3r-pattern resconv. Broken on Blackhole for
-        # VGGT's DPT sizes (see TODO.md P0). Kept as reference while the
-        # tt-metal aliasing bug is investigated; whole scratch port is
-        # gated behind VGGT_TT_SCRATCH=1 so it doesn't run by default.
+        # The "canonical" mast3r-pattern resconv. Currently broken on
+        # Blackhole for VGGT's DPT sizes: tt_x's device buffer is aliased
+        # somewhere between here and the final add (PCC drops 1.0 → 0.33).
+        # Workarounds tried & failed: ttnn.clone, sharded_to_interleaved,
+        # to_memory_config(DRAM), synchronize_device, program-cache
+        # disable, host-roundtrip snapshot+reupload before add, full host
+        # add. None recover PCC. Next step is likely a minimal-repro
+        # upstream bug report. See TODO.md P0.
         tt_relu = ttnn.relu(tt_x)
         tt_c1 = _conv2d(tt_relu, w[f"{prefix}_c1_w"], w[f"{prefix}_c1_b"], ch, ch, B, H, W, dev)
         tt_c1 = ttnn.relu(tt_c1)

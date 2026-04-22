@@ -164,7 +164,9 @@ def main():
     import ttnn
 
     device = ttnn.open_device(device_id=args.device_id, l1_small_size=32 * 1024)
-    if hasattr(device, "enable_program_cache"):
+    if os.environ.get("VGGT_NO_PROGRAM_CACHE", "0") not in ("", "0"):
+        print("[test_vggt] program cache disabled via VGGT_NO_PROGRAM_CACHE", flush=True)
+    elif hasattr(device, "enable_program_cache"):
         device.enable_program_cache()
 
     # BF1: close the chip cleanly on SIGINT/SIGTERM so the ETH mesh doesn't
