@@ -653,6 +653,15 @@ def _install_ttnn_dpt_scratch(model, device):
         # (1,1024,37,37), (1,1024,19,19). For S>1 first dim is B*S.
         Bs = layer_1.shape[0]
 
+        # For Bs > 1, the per-refinenet host upsample round-trip doubles
+        # (or more) in data volume, and the Python/ttnn overhead per
+        # refinenet compounds: net wall-clock regresses vs the host path
+        # at S=2 (+7 % in practice). Fall back to original host forward
+        # for Bs > 1 until a device fp32 bilinear upsample is available.
+        # Opt out via VGGT_TT_SCRATCH_ALL_BS=1.
+        if Bs > 1 and os.environ.get("VGGT_TT_SCRATCH_ALL_BS", "0") in ("", "0"):
+            return self._orig_scratch_forward(features)
+
         # Upload 4 features as ROW_MAJOR flat and run layer_rn (3×3 conv, no bias).
         def _layer_rn(idx, host_t):
             tt_in, Bs_i, Hi, Wi = _upload_nchw_as_flat(host_t, dev)

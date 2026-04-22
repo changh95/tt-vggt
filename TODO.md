@@ -165,13 +165,30 @@ precision-sensitive. The settled configuration:
 
 ### Known-good / remaining knobs
 
-- Current S=1 win: 8.4 %. Not yet the P0-expected ~150 ms because
-  host upsample round-trips eat most of the saved device compute.
-- S=2 regresses ~7 % — host-upsample volume doubles. Revisit when
-  a fp32 device upsample is available on Blackhole, OR when we have
-  a way to keep tensors on device through an integer-scale upsample
-  at bf16 without losing conf PCC (likely requires the precise
-  matmul-program-config tuning from P2/P3-related follow-ups).
+- Current S=1 win: **+8.1 %** (1466 → 1348 ms best-of-3). Not yet
+  the P0-expected ~150 ms because host upsample round-trips eat
+  most of the saved device compute.
+- At Bs > 1 the port regresses (host-upsample round-trip volume
+  scales linearly, per-refinenet ttnn Python overhead compounds).
+  **Gated off automatically for Bs > 1** — falls back to the
+  original host `scratch_forward`, so S=2 matches baseline
+  (2399 ms ≈ 2392 ms noise) at PCC 0.9981. Opt back in at Bs > 1
+  via `VGGT_TT_SCRATCH_ALL_BS=1` if testing a fix.
+- Future S>1 speedup paths (in order of ease):
+  1. **fp32 device bilinear upsample.** The current 0.955 PCC
+     collapse is from the bf16 input the Blackhole bilinear kernel
+     demands. If ttnn gains a fp32 bilinear path on Blackhole, we
+     can drop the host round-trip entirely and both S=1 and S=2
+     should win.
+  2. **Stream the host upsample.** The current code does the
+     download → torch F.interpolate → upload serially per
+     refinenet. Overlapping the next refinenet's compute with the
+     previous upsample's upload would hide the transfer. Needs
+     async ttnn, not just PCIe.
+  3. **Pre-sharded matmul/upsample program_config** (the same
+     mast3r-style trick listed in the precision-follow-ups
+     section). Likely removes most of the per-call Python
+     overhead that compounds at Bs > 1.
 
 **What's verified correct:**
 - `layer{1..4}_rn`: PCC = 1.0000 at all 4 spatial sizes (148/74/37/19)
