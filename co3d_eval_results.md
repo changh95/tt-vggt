@@ -27,32 +27,81 @@ Goal: evaluate the ttnn port of VGGT on **real data** (CO3Dv2) with two metrics:
   (not committed) that lets the RoPE cos/sin lookup handle variable S
   (recompute per pos-tensor shape, cache per shape).
 
-## Headline
+## Headline (12 scenes, 6 categories, S=2)
 
-| Metric                       | reference | port   | Δ (port − ref) |
-|------------------------------|-----------|--------|---------------:|
-| mean pcc_pose_enc            | —         | 0.9999 | (port vs ref)  |
-| mean pcc_depth               | —         | 0.9947 | (port vs ref)  |
-| mean pcc_depth_conf          | —         | 0.9985 | (port vs ref)  |
-| mean pcc_world_points        | —         | 0.9999 | (port vs ref)  |
-| mean pcc_world_points_conf   | —         | 0.9996 | (port vs ref)  |
-| mean RRA@5°  (3 pairs)       |  0.0 %    | 33.3 % |         +33.3  |
-| mean RRA@15° (3 pairs)       | 100.0 %   | 100.0 %|          +0.0  |
-| mean RTA@5°  (3 pairs)       | 66.7 %    | 66.7 % |          +0.0  |
-| mean RTA@15° (3 pairs)       | 100.0 %   | 100.0 %|          +0.0  |
-| mean AUC@30°                 | 87.2      | 86.1   |          −1.1  |
+Dataset expanded from the original 3-apple-scene run to
+**6 categories × 1–3 scenes = 12 scenes**: apple, bottle, chair, laptop,
+hydrant, teddybear. 12 relative-pose pairs total. Chamfer additionally
+reported on the 6 scenes that ship a `pointcloud.ply` (apple ×2, hydrant
+×2, teddybear ×2); bottle, chair, laptop single-sequence bundles don't
+include a GT pointcloud.
+
+| Metric                                    | reference | port   | Δ (port − ref) |
+|-------------------------------------------|-----------|--------|---------------:|
+| mean pcc_pose_enc                         | —         | 1.0000 | (port vs ref)  |
+| mean pcc_depth                            | —         | 0.9982 | (port vs ref)  |
+| mean pcc_depth_conf                       | —         | 0.9992 | (port vs ref)  |
+| mean pcc_world_points                     | —         | 0.9996 | (port vs ref)  |
+| mean pcc_world_points_conf                | —         | 0.9997 | (port vs ref)  |
+| mean RRA@5°  (12 pairs)                   |  66.7 %   | 75.0 % |         +8.3   |
+| mean RRA@15° (12 pairs)                   | 100.0 %   | 100.0 %|         +0.0   |
+| mean RTA@5°  (12 pairs)                   |  91.7 %   | 83.3 % |         −8.3   |
+| mean RTA@15° (12 pairs)                   | 100.0 %   | 100.0 %|         +0.0   |
+| mean AUC@30°                              |  91.9     | 91.4   |         −0.6   |
+| mean Chamfer (6 scenes, median-scaled)    |  0.1993   | 0.2020 |         +0.0026 |
+
+Per-category:
+
+| category   | scenes | pairs | min_pcc | ref AUC30 | port AUC30 | Δ AUC30 | ref Cham | port Cham |
+|------------|-------:|------:|--------:|----------:|-----------:|--------:|---------:|----------:|
+| apple      | 3      | 3     | 0.9861  | 87.2      | 86.1       | −1.1    | 0.1476   | 0.1494    |
+| bottle     | 1      | 1     | 0.9985  | 91.7      | 91.7       | +0.0    | —        | —         |
+| chair      | 1      | 1     | 0.9996  | 98.3      | 98.3       | +0.0    | —        | —         |
+| hydrant    | 3      | 3     | 0.9982  | 96.1      | 96.1       | +0.0    | 0.2089   | 0.2129    |
+| laptop     | 1      | 1     | 0.9994  | 91.7      | 91.7       | +0.0    | —        | —         |
+| teddybear  | 3      | 3     | 0.9985  | 90.6      | 89.4       | −1.1    | 0.2415   | 0.2436    |
 
 **Takeaways:**
-- Every output channel has port-vs-ref PCC ≥ 0.994 on real photographs. The
-  `world_points_conf` channel — the one that collapsed under bf16 stress in
-  synthetic tests — is 0.9996 on CO3D. The port's precision budget is
-  honest, not fitting noise.
-- Port loses **≈1.1 AUC@30° points** vs the torch reference, an honest
-  measure of the bf16 + HiFi4 quantization cost on real geometry. The 3×
-  wall-clock speedup buys this back easily.
-- RRA@5 port > ref (+33%) is a 3-sample artifact, not signal: with 3 pairs
-  one sample is 33%, and both runs agree within the same rotation-error
-  bucket at 15°. Bigger N needed for the 5° bucket to be stable.
+- Every output channel has port-vs-ref PCC ≥ 0.986 on real photographs,
+  mean ≥ 0.998 across all outputs. The `world_points_conf` channel —
+  the one that collapsed under bf16 stress in synthetic tests — is
+  0.9997 on CO3D real data. The port's precision budget is honest.
+- **Port loses 0.6 AUC@30° points** on average vs the torch reference
+  (vs −1.1 on the original 3-scene apple-only run). The 3× wall-clock
+  speedup buys this back easily. The 4 categories with clean geometry
+  (bottle/chair/hydrant/laptop) all show Δ_AUC30 = 0. apple +
+  teddybear each contribute ~1 point AUC30 loss — these scenes have
+  harder geometry (small objects with reflective surfaces / deformable
+  fur) where the bf16 + HiFi4 quantization bite is larger.
+- **Chamfer is effectively tied** (+0.0026 absolute, +1.3 % relative).
+  Confirms the PCC-derived claim: the port's predicted world geometry
+  is quantitatively comparable to the torch reference against real
+  GT pointclouds, not just against its own reference.
+- RTA@5° flipping to −8.3 while RRA@5° flips to +8.3 is a 12-pair
+  artifact — each pair is one bernoulli sample at the 5° bucket. Both
+  metrics are at 100 % at the 15° bucket across all 12 pairs.
+
+## Viewpoint-conversion sanity check
+
+The PyTorch3D → OpenCV extrinsic conversion in `eval_vggt.py`
+(`co3d_to_opencv_extrinsic`) was validated by projecting the 6 scenes'
+CO3D `pointcloud.ply` through the converted camera-0 extrinsic and
+checking the fraction of points with `z > 0` (in front of camera):
+
+```
+apple/110_13051_23361:   in_front_frac = 1.000  (n=418 529)
+apple/189_20393_38136:   in_front_frac = 1.000  (n=595 272)
+hydrant/167_18184_34441: in_front_frac = 1.000  (n=798 463)
+hydrant/411_56064_108483:in_front_frac = 1.000  (n=672 171)
+teddybear/187_20215_38541: in_front_frac = 1.000  (n=980 001)
+teddybear/34_1479_4753:    in_front_frac = 1.000  (n=980 001)
+```
+
+100 % of GT points land in front of camera 0 on every scene. A sign
+or transpose error in the conversion would produce ~0 % or ~50 %, so
+this is a cheap and strong guard. `viewpoint_sanity()` runs
+automatically inside `eval_vggt.py::eval_scene` now and flags any
+scene that drops below 90 %.
 
 ## Per-scene (2 views, 1 pair each)
 

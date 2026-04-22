@@ -41,7 +41,7 @@ def main():
 
     import ttnn
     from tt.ttnn_vggt import vggt_forward, _ensure_installed
-    device = ttnn.open_device(device_id=0, l1_small_size=32 * 1024)
+    device = ttnn.open_device(device_id=2, l1_small_size=32 * 1024)
     if hasattr(device, "enable_program_cache"):
         device.enable_program_cache()
     try:

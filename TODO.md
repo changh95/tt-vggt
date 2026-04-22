@@ -23,6 +23,8 @@ in ~5 min for 3 scenes, S=3 and S=4 hang for 20+ min on the **first**
 forward of scene 1 and never produce output. Killing the process (`kill -9`)
 leaves the p150a chip in a bad firmware state; recovery requires
 `tt-smi -r 0 1 2 3` which also bounces the other 3 chips on the host.
+(Per-chip `tt-smi -r 2` does **not** recover — the ETH heartbeat on the
+wedged ASIC stays at `post code: c0de0000` through the re-init.)
 
 Root cause (hypothesised, unverified): each `ttnn` op compiles a new
 program on first encounter of a (shape, layout, memory_config) tuple. The
@@ -33,20 +35,27 @@ S=1 primed the program cache for ~1374-token shapes; S=3 introduces ~4122
 first-time. Compile per new shape is seconds-to-tens-of-seconds; cumulative
 compile time blows up.
 
-Candidate fixes (pick one):
+Candidate fixes — **option 1 has been attempted and ruled out:**
 
-1. **Pre-warm at install time.** In `_ensure_installed`, after weight
-   uploads, run a dummy forward at each S we expect to serve (e.g., 1, 2,
-   4, 8) on a zero-tensor input. One-time ~minutes install cost buys
-   fast first-real-forward. Simplest; recommended.
-2. **Pad to a canonical S.** Always pass S=8 (or the max S we care about)
-   to the aggregator and mask out unused frames. Only one shape set ever
-   hits the program cache. Needs small attention-mask plumbing to avoid
-   leaking information from padding frames into real ones.
+1. ~~**Pre-warm at install time.**~~ **Tried and does not work.**
+   `_prewarm_seqs(model, device, (1,2,4,8))` was added to
+   `_ensure_installed` and verified: S=1 prewarm 2.0 s / PCC 0.9959;
+   S=2 prewarm 3.3 s / PCC 0.9981; **S=4 prewarm hangs 40+ min at 99%
+   CPU** with zero log progress after device open. Python `SIGTERM`
+   never fires (handler can't run while ttnn is in a deep C++ compile
+   call), so recovery requires `SIGKILL`, which wedges the chip. The
+   "prewarm" call is still exercised by test_vggt.py / eval_vggt.py but
+   is clamped to `S ≤ 2` by default; pass `--prewarm-seqs` to opt in.
+2. **Pad to a canonical S.** Always pass `S=S_max` (say 8) to the
+   aggregator and mask out unused frames. Only one shape set ever hits
+   the program cache. Needs attention-mask plumbing in
+   `Aggregator.forward` (global attention: prevent padding frames from
+   contributing to real ones) and result-slice to trim the output back
+   to the requested S. **Current recommendation — implement this next.**
 3. **mast3r-style pre-computed `MatmulMultiCoreReuseMultiCastProgramConfig`.**
    Pin matmul shard strategies manually so the auto-discovery compile path
-   (which is what's actually slow) is bypassed. Most invasive but mirrors
-   the sibling experiment's proven pattern.
+   (which is what's actually slow) is bypassed. Most invasive. Needed
+   anyway for further perf tuning; can be staged after option 2.
 
 Until BF0 is fixed, evaluation is stuck at S=2 / 1 pair per scene (coarse
 but functional — see `co3d_eval_results.md`).
@@ -54,21 +63,42 @@ but functional — see `co3d_eval_results.md`).
 ### BF1 — Hard-kill corrupts the device mesh
 
 Any ungraceful exit of a ttnn process (SIGKILL, OOM, stack overflow)
-leaves device 0 with ETH heartbeat stuck at `post code: c0de0000`,
+leaves the target ASIC with ETH heartbeat stuck at `post code: c0de0000`,
 cascading to topology discovery failures across all 4 chips on the host.
 Recovery requires `tt-smi -r 0 1 2 3` which bounces the whole mesh and
 disturbs other experiments' sessions (pi0, medgemma, mast3r all run on
-chips 0-3 on this box).
+chips 0-3 on this box). **Per-chip `tt-smi -r N` is not sufficient** —
+verified on the post-BF0-kill wedge: `tt-smi -r 2` re-ran re-init but
+the heartbeat check kept failing on the same ASIC.
 
-### Plan
+Python-level `SIGINT`/`SIGTERM` handlers (test_vggt.py + eval_vggt.py)
+are wired but **do not fire during the exact scenario we need**, because
+the hang is inside a deep C++ ttnn-compile call and Python's signal
+dispatcher can't run until C returns. This means ordinary benign exits
+(Ctrl-C during Python code) close cleanly, but the BF0-style compile
+hang still forces SIGKILL → chip wedge. Handler plumbing is still worth
+having for the benign paths.
 
-1. Register a `signal.SIGTERM` / `SIGINT` handler in `test_vggt.py` and
-   `eval_vggt.py` that closes the ttnn device cleanly before Python exits.
-2. Add a `try: ... finally: ttnn.close_device(device)` at the topmost
-   script level (already present in `eval_vggt.py`, missing in
-   `test_vggt.py` for crash paths).
-3. Document the recovery command in `co3d_eval_results.md` / `README`
-   so operators don't escalate to a full host reboot.
+### Plan (remaining)
+
+1. ~~Register a `signal.SIGTERM` / `SIGINT` handler in `test_vggt.py` and
+   `eval_vggt.py`.~~ **Done** — closes the device on benign exits; does
+   not help compile-stall kills (see above).
+2. ~~Add a `try: ... finally: ttnn.close_device(device)` at the topmost
+   script level.~~ **Done** — `_close_once()` helper shared between
+   finally-block and signal handler.
+3. **Still open:** prevent the BF0 compile stall in the first place
+   (see option 2 in BF0) so operators never need SIGKILL. This is the
+   real fix; the cosmetic shutdown handlers are a secondary measure.
+4. **Still open:** document the recovery command in
+   `co3d_eval_results.md` / `README` so operators don't escalate to a
+   full host reboot, AND warn that per-chip `-r N` doesn't recover —
+   only the full 4-chip reset does.
+5. **Still open:** investigate whether a ttnn compile timeout exists
+   that could watchdog the forward and abort before the wedge. If not,
+   consider a Python-side watchdog thread that sends SIGKILL to self if
+   a single op takes >N seconds, so the abort happens before we reach
+   the stuck state (rather than after).
 
 ---
 
@@ -76,7 +106,87 @@ chips 0-3 on this box).
 
 Remaining CPU cost: ~194 ms × 2 heads = **388 ms** (biggest single chunk left).
 
-Attempted once (`2b2bf2d` discard row), broke to PCC -0.08. Root cause: I didn't replicate mast3r's exact layout-conversion pattern between chained `ttnn.conv2d` / `ttnn.linear` / `ttnn.upsample` / `ttnn.add` calls. Reference working pattern at `/home/ttuser/experiments/mast3r/tt-metal/models/demos/mast3r/tt/ttnn_dust3r.py:811+` (`_conv2d`, `_resconv`, `_tokens_to_nhwc`, `_flat_to_nhwc`, `_nhwc_to_flat`, `_linear_1x1`).
+Attempted twice. First pass (`2b2bf2d` discard row) broke to PCC -0.08.
+Second pass copied mast3r's layout helpers verbatim (`_tokens_to_nhwc`,
+`_flat_to_nhwc`, `_nhwc_to_flat`, `_linear_1x1`, `_conv2d`, `_resconv`
+from `/home/ttuser/experiments/mast3r/tt-metal/models/demos/mast3r/tt/ttnn_dust3r.py:813+`)
+and split the port into per-refinenet steps with a PCC probe at every
+boundary (env `VGGT_TT_SCRATCH_COMPARE=1`). Install + patch infrastructure
+lives in `_install_ttnn_dpt_scratch()`, currently gated behind
+`VGGT_TT_SCRATCH=1` (default OFF) so the rest of the model still runs
+while this is in debug.
+
+**What's verified correct:**
+- `layer{1..4}_rn`: PCC = 1.0000 at all 4 spatial sizes (148/74/37/19)
+  immediately after the conv2d.
+- Each primitive in `_resconv` in isolation: `relu(x)`, `conv1`, `relu`,
+  `conv2` — PCC = 1.0000 when measured right after each op against
+  the host-rebuilt reference.
+
+**What's broken (root cause still open):**
+
+Tracing with per-op `ttnn.to_torch` probes revealed that `tt_x` (the
+residual tensor, also the first arg to `ttnn.add(tt_x, tt_c2)`) is
+**destructively aliased** somewhere between `layer_rn` output and the
+final add:
+
+```
+[scratch compare] layer4_rn:                     PCC=1.0000   (pristine)
+[scratch compare] step1 relu:                    PCC=1.0000
+[scratch compare] step2 conv1:                   PCC=1.0000
+[scratch compare] step3 relu2:                   PCC=1.0000
+[scratch compare] step4 conv2:                   PCC=1.0000
+[scratch compare] tt_l4 pre-add:                 PCC=0.3365   (corrupted!)
+[scratch compare] tt_c2 pre-add:                 PCC=1.0000
+[scratch compare] step5 add (raw):               PCC=0.3475   (bad input → bad output)
+[scratch compare] step5 add (fresh tt_l4 upload): PCC=1.0000   (proves corruption)
+```
+
+- `tt_l4`'s Python ref is live across the chain; nothing visible mutates it.
+- Forcing TILE↔ROW_MAJOR layouts, `ttnn.sharded_to_interleaved`,
+  `ttnn.to_memory_config(DRAM_MEMORY_CONFIG)`, `ttnn.synchronize_device`
+  between ops, and `ttnn.clone(tt_x)` **all fail** to preserve `tt_l4`.
+- The **only** workaround that gives PCC 1.0 on the add is re-uploading
+  from a host-side copy (`_upload_nchw_as_flat(layer_4_rn_host, dev)`),
+  which proves the corruption is in the original device buffer itself,
+  not in Python bookkeeping.
+- Even pulling `tt_l4` to host inside `_resconv` via `ttnn.to_torch(tt_x)`
+  at the start and doing the residual add on host doesn't recover PCC —
+  suggesting the corruption has already happened by the time `_resconv`'s
+  first line runs, or `ttnn.to_torch` itself is not a snapshot.
+
+### Next debug steps (assume ttnn ≥ tt-metal-level understanding)
+
+1. **Repro in a minimal standalone script.** Strip out everything except:
+   upload a (1, 256, 19, 19) tensor → `ttnn.conv2d` (just the 3×3 with bias) →
+   `ttnn.relu` → `ttnn.conv2d` → `ttnn.add(original, last)`. If this
+   minimal repro fails the same way, file it upstream.
+2. **Investigate program-cache aliasing.** ttnn caches programs on
+   `(shape, layout, memory_config)`. Two ops with the same cache entry
+   may re-use device scratch regions. Try disabling the program cache
+   (`device.disable_and_clear_program_cache()`) and see if
+   `_resconv` starts producing correct output.
+3. **Check whether conv2d's prepared weight tensor aliases the input.**
+   ttnn.conv2d creates an internal "prepared weights" buffer the first
+   time a new (H, W, C, stride) is seen. Maybe that allocation
+   intersects `tt_l4`'s buffer on Blackhole's allocator strategy.
+4. **Cross-reference with a Blackhole-native mast3r run.** mast3r's
+   `_resconv` is believed to work on Blackhole — verify, then diff
+   allocation / memory-config flows.
+5. **Fall back to host add if all else fails.** Running the residual
+   on host costs ~3 µs of L2/DRAM bandwidth per refinenet (184 KB at
+   (19,19); larger but still small at 148). A host-add `_resconv` gives
+   up some device efficiency but lets us ship a PCC-clean port in the
+   meantime while upstream investigates the alias.
+
+### Harness available
+
+- `VGGT_TT_SCRATCH=1` enables the port at `_ensure_installed` time.
+- `VGGT_TT_SCRATCH_COMPARE=1` prints per-op PCC probes against a
+  synchronously-computed host reference; any regression (or recurrence
+  of this alias bug) shows up immediately.
+
+Reference working pattern at `/home/ttuser/experiments/mast3r/tt-metal/models/demos/mast3r/tt/ttnn_dust3r.py:811+` (`_conv2d`, `_resconv`, `_tokens_to_nhwc`, `_flat_to_nhwc`, `_nhwc_to_flat`, `_linear_1x1`).
 
 ### Plan
 
@@ -198,11 +308,40 @@ Currently `packer_l1_acc=True` on HiFi4 configs. Haven't tried `dst_full_sync_en
 
 ---
 
-## Stretch: NoC / Tracy profiling
+## Tracy profiling
 
-Per `PROGRAM.md`: run `python3 -m tracy --collect-noc-traces --profiler-capture-perf-counters=all ... test_vggt.py` to get:
-- Per-op SFPU / FPU utilisation.
-- NoC and DRAM bandwidth actual-vs-peak.
-- Where the Block forward spends device time (softmax? matmul? upsample?).
+Wrapper script at `profile_tracy.sh`. Pins to chip 2, resolves to
+`medgemma/tt-metal` (Tracy-enabled build — the venv's default `.pth`
+points at `pi0_5/tt-metal` which has `ENABLE_TRACY:BOOL=OFF`).
 
-Use this to pick the next matmul to shard aggressively. Expected wins are small (few %) individually but compound.
+Works today:
+- `tracy_profile_log_host.tracy` (~53 MB per S=1 run) — open in the
+  Tracy GUI for a full flame / op-by-op / zone breakdown.
+- `tracy_ops_data.csv` (~2 MB) — per-op JSON metadata, joinable via
+  `GLOBAL CALL COUNT` with the device-side CSV.
+- `cpp_device_perf_report.csv` — device-side kernel durations
+  (column values need verification; the units / cycle-count mapping on
+  Blackhole look off vs the wall-clock; usable for relative ordering
+  but not absolute latency).
+
+Known Blackhole post-processor issues (worth a tt-metal PR upstream):
+- `--collect-noc-traces` triggers `TT_FATAL: Invalid NoC transfer type
+  on device: 2` — `noc_xfer_type` validator at
+  `tt_metal/impl/profiler/profiler.cpp:600` doesn't cover Blackhole
+  event IDs. Dropped from the wrapper until fixed.
+- `--profiler-capture-perf-counters=all` causes a pandas dtype error
+  in `tracy/process_ops_logs.py` (tries to set int64 values on a
+  "str" trace-id column). Dropped for now.
+- Python post-processor `_enrich_ops_from_perf_csv` asserts
+  `Device data missing: Op N not present in cpp_device_perf_report.csv
+  for device 2` when joining host ops to device perf rows. Raw data
+  is fine — a custom parser would round-trip it, but the first-party
+  `ops_perf_results_*.csv` summary doesn't get generated. Usable as
+  GUI session only.
+
+Recommended usage:
+- `bash profile_tracy.sh` → load `tracy_profile_log_host.tracy` in the
+  Tracy GUI for a live, interactive device profile. Use that to pick
+  which matmul / LN / softmax to target next.
+- For automated op ranking, parse `cpp_device_perf_report.csv` +
+  `tracy_ops_data.csv` directly (GLOBAL CALL COUNT is the join key).

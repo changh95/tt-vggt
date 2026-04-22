@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
 import time
 import traceback
@@ -86,8 +87,10 @@ def device_peak_dram_mb(device) -> float:
 
 def print_result(layer: str, pcc_val: float, latency_ms: float,
                  status: str, peak_dram_mb: float = 0.0,
-                 per_key_pcc: dict | None = None):
-    speed = (1000.0 / latency_ms) if latency_ms > 0 else 0.0
+                 per_key_pcc: dict | None = None, seq: int = 1):
+    # inference_speed reports frames/s. For S>1 each call produces S
+    # frames of output, so multiply by S.
+    speed = (seq * 1000.0 / latency_ms) if latency_ms > 0 else 0.0
     accuracy = max(0.0, min(100.0, pcc_val * 100.0))
     print(f"--- layer: {layer}")
     print(f"pcc: {pcc_val:.4f}")
@@ -150,9 +153,12 @@ def main():
     parser.add_argument("--seq", type=int, default=1,
                         help="Number of views (S). VGGT supports variable S.")
     parser.add_argument("--img-size", type=int, default=518)
-    parser.add_argument("--device-id", type=int, default=0,
-                        help="Tenstorrent UMD chip id. Assigned PROGRAM.md number is 7 "
-                             "but this host only exposes UMD ids 0-3 (2xp300c).")
+    parser.add_argument("--device-id", type=int, default=2,
+                        help="Tenstorrent UMD chip id. This project is pinned to "
+                             "chip 2 on the shared 4-chip host.")
+    parser.add_argument("--prewarm-seqs", default="",
+                        help="Comma-separated S values to pre-warm at install. "
+                             "Default: the --seq value. See BF0 in TODO.md.")
     args = parser.parse_args()
 
     import ttnn
@@ -160,25 +166,55 @@ def main():
     device = ttnn.open_device(device_id=args.device_id, l1_small_size=32 * 1024)
     if hasattr(device, "enable_program_cache"):
         device.enable_program_cache()
+
+    # BF1: close the chip cleanly on SIGINT/SIGTERM so the ETH mesh doesn't
+    # wedge after Ctrl-C. Can't catch SIGKILL but this handles the common
+    # cases (user-interrupt, timeout, OOM killer delivering SIGTERM first).
+    _closed = [False]
+    def _close_once():
+        if _closed[0]:
+            return
+        _closed[0] = True
+        try:
+            ttnn.close_device(device)
+        except Exception:
+            traceback.print_exc()
+    def _sig_handler(signum, _frame):
+        print(f"\n[test_vggt] caught signal {signum}, closing device...", flush=True)
+        _close_once()
+        sys.exit(128 + signum)
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+
     try:
         if args.layer not in LAYER_DISPATCH:
-            print_result(args.layer, 0.0, 0.0, "crash")
+            print_result(args.layer, 0.0, 0.0, "crash", seq=args.seq)
             print(f"ERROR: unknown layer '{args.layer}'")
             return 2
+        if args.prewarm_seqs:
+            prewarm = tuple(int(s) for s in args.prewarm_seqs.split(",") if s)
+        else:
+            # BF0 note: prewarming at S>2 hits a 20+ min ttnn compile stall
+            # (prewarm-at-install does NOT relocate the stall to a safe
+            # window — the compile itself is slow). Default to known-safe
+            # values; pass --prewarm-seqs explicitly to opt in to risky S.
+            prewarm = (args.seq,) if args.seq <= 2 else (1, 2)
+        from tt.ttnn_vggt import _ensure_installed
+        _ensure_installed(device, prewarm_seqs=prewarm)
         try:
             pcc_val, per_key, latency_ms = LAYER_DISPATCH[args.layer](
                 device, args.runs, args.batch, args.seq, args.img_size
             )
             peak = device_peak_dram_mb(device)
             status = "PASS" if pcc_val >= 0.99 else "FAIL"
-            print_result(args.layer, pcc_val, latency_ms, status, peak, per_key)
+            print_result(args.layer, pcc_val, latency_ms, status, peak, per_key, seq=args.seq)
             return 0 if status == "PASS" else 1
         except Exception:
             traceback.print_exc()
-            print_result(args.layer, 0.0, 0.0, "crash")
+            print_result(args.layer, 0.0, 0.0, "crash", seq=args.seq)
             return 3
     finally:
-        ttnn.close_device(device)
+        _close_once()
 
 
 if __name__ == "__main__":
