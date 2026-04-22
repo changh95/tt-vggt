@@ -102,19 +102,76 @@ having for the benign paths.
 
 ---
 
-## P0 — Device-native DPT `scratch_forward` refinenets
+## P0 — Device-native DPT `scratch_forward` refinenets ✅ DONE
 
-Remaining CPU cost: ~194 ms × 2 heads = **388 ms** (biggest single chunk left).
+Landed on main with `VGGT_TT_SCRATCH=1` as default. Measured S=1
+best-of-3: **1343 ms vs baseline 1466 ms = 8.4 % wall-clock win**.
+PCC 0.9957 (baseline 0.9959; Δ = 0.0002 on min-channel PCC, well above
+the 0.99 threshold). S=2 regresses by ~7 % because host-upsample
+round-trip volume scales linearly and the per-frame conv compute win
+doesn't fully absorb it — tracked as an optimisation follow-up below.
 
-Attempted twice. First pass (`2b2bf2d` discard row) broke to PCC -0.08.
-Second pass copied mast3r's layout helpers verbatim (`_tokens_to_nhwc`,
-`_flat_to_nhwc`, `_nhwc_to_flat`, `_linear_1x1`, `_conv2d`, `_resconv`
-from `/home/ttuser/experiments/mast3r/tt-metal/models/demos/mast3r/tt/ttnn_dust3r.py:813+`)
-and split the port into per-refinenet steps with a PCC probe at every
-boundary (env `VGGT_TT_SCRATCH_COMPARE=1`). Install + patch infrastructure
-lives in `_install_ttnn_dpt_scratch()`, currently gated behind
-`VGGT_TT_SCRATCH=1` (default OFF) so the rest of the model still runs
-while this is in debug.
+Install + patch infrastructure lives in `_install_ttnn_dpt_scratch()`
+with `VGGT_TT_SCRATCH_COMPARE=1` as a live PCC harness. Helpers follow
+mast3r's layout pattern from
+`/home/ttuser/experiments/mast3r/tt-metal/models/demos/mast3r/tt/ttnn_dust3r.py:813+`
+(`_tokens_to_nhwc`, `_flat_to_nhwc`, `_nhwc_to_flat`, `_linear_1x1`,
+`_conv2d`, `_resconv`).
+
+### The bug that ate 3 hours
+
+`_resconv`'s residual add looked like
+`return ttnn.add(tt_x, tt_c2)` — mirroring a textbook ResNet block.
+But VGGT's `ResidualConvUnit` uses `nn.ReLU(inplace=True)`:
+
+```python
+def forward(self, x):
+    out = self.activation(x)   # inplace: x is now relu(x)
+    out = self.conv1(out); ...
+    out = self.conv2(out)
+    return self.skip_add.add(out, x)  # x here is RELU(x_original)
+```
+
+So the math the reference host forward is computing is
+`conv2(relu(conv1(relu(x)))) + relu(x)`, not `... + x`. My device
+`_resconv` needed `ttnn.add(tt_relu, tt_c2)` where `tt_relu` is the
+*first* relu's output. This masqueraded as an alias/corruption bug
+because the compare harness I wrote *also* relied on the in-place-
+mutated `layer_4_rn_host` as the reference, which made the device
+output look catastrophically wrong. Once the compare harness was
+rewritten to use a `.clone()` + `F.relu` (out-of-place), per-op PCCs
+went to 1.0 and only the end-to-end number stayed bad — at which
+point the missing `relu(x)` in the device residual became obvious.
+
+### Precision knobs used
+
+Conf channels feed `expp1` in `activate_head` and are unusually
+precision-sensitive. The settled configuration:
+
+- `_conv2d` calls inside `_resconv` request `dtype=ttnn.float32` so
+  their outputs stay in fp32.
+- `tt_relu` is cast to fp32 before `ttnn.add(tt_relu, tt_c2)` so the
+  residual add is fp32 end-to-end.
+- `_linear_1x1` out_conv inside `_refinenet_device` requests fp32
+  output so the next refinenet reads an fp32 tensor.
+- `output_conv1` (final scratch conv) emits fp32 too — feeds host
+  `custom_interpolate` → existing output_conv2 port → `expp1`.
+- ttnn.upsample bilinear requires bf16 input on Blackhole, so
+  `_refinenet_device` casts back to bf16 just before upsample.
+- **Host upsample** (torch `F.interpolate` fp32 bilinear) is used for
+  every refinenet, not just the non-integer 19→37 one. Device bf16
+  bilinear drops conf PCC to ~0.955 — good for depth / world_points
+  but below the 0.99 threshold. Host upsample brings it back to 0.9957.
+
+### Known-good / remaining knobs
+
+- Current S=1 win: 8.4 %. Not yet the P0-expected ~150 ms because
+  host upsample round-trips eat most of the saved device compute.
+- S=2 regresses ~7 % — host-upsample volume doubles. Revisit when
+  a fp32 device upsample is available on Blackhole, OR when we have
+  a way to keep tensors on device through an integer-scale upsample
+  at bf16 without losing conf PCC (likely requires the precise
+  matmul-program-config tuning from P2/P3-related follow-ups).
 
 **What's verified correct:**
 - `layer{1..4}_rn`: PCC = 1.0000 at all 4 spatial sizes (148/74/37/19)

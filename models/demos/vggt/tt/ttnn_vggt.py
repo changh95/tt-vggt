@@ -541,19 +541,23 @@ def _install_ttnn_dpt_scratch(model, device):
             )
         return _SCRATCH_KCFG
 
-    def _conv2d(tt_x, w_t, b_t, in_c, out_c, B, H, W, dev, k=3, stride=1, padding=1):
+    def _conv2d(tt_x, w_t, b_t, in_c, out_c, B, H, W, dev, k=3, stride=1, padding=1, dtype=None):
         return ttnn.conv2d(
             input_tensor=tt_x, weight_tensor=w_t, bias_tensor=b_t,
             device=dev, in_channels=in_c, out_channels=out_c,
             batch_size=B, input_height=H, input_width=W,
             kernel_size=(k, k), stride=(stride, stride), padding=(padding, padding),
             compute_config=_kcfg(dev),
+            **({"dtype": dtype} if dtype is not None else {}),
         )
 
-    def _linear_1x1(tt_x, w_lin, b_lin):
+    def _linear_1x1(tt_x, w_lin, b_lin, dtype=None):
         if tt_x.layout != ttnn.TILE_LAYOUT:
             tt_x = ttnn.to_layout(tt_x, ttnn.TILE_LAYOUT)
-        return ttnn.linear(tt_x, w_lin, bias=b_lin, compute_kernel_config=_kcfg(tt_x.device()))
+        kwargs = {"compute_kernel_config": _kcfg(tt_x.device())}
+        if dtype is not None:
+            kwargs["dtype"] = dtype
+        return ttnn.linear(tt_x, w_lin, bias=b_lin, **kwargs)
 
     def _flat_to_nhwc(tt_x, B, H, W, C):
         if tt_x.layout != ttnn.ROW_MAJOR_LAYOUT:
@@ -569,19 +573,20 @@ def _install_ttnn_dpt_scratch(model, device):
         return tt_x
 
     def _resconv(tt_x, w, prefix, ch, B, H, W, dev):
-        # The "canonical" mast3r-pattern resconv. Currently broken on
-        # Blackhole for VGGT's DPT sizes: tt_x's device buffer is aliased
-        # somewhere between here and the final add (PCC drops 1.0 → 0.33).
-        # Workarounds tried & failed: ttnn.clone, sharded_to_interleaved,
-        # to_memory_config(DRAM), synchronize_device, program-cache
-        # disable, host-roundtrip snapshot+reupload before add, full host
-        # add. None recover PCC. Next step is likely a minimal-repro
-        # upstream bug report. See TODO.md P0.
+        # VGGT's host ResidualConvUnit uses nn.ReLU(inplace=True), which
+        # mutates `x` in-place on the first activation. So the residual
+        # add is actually `conv2(...) + relu(x)`, not `conv2(...) + x`.
+        # Precision: both conv outputs in fp32. DPT's expp1-activated
+        # conf channels lose ~4% PCC with bf16 anywhere in the chain.
         tt_relu = ttnn.relu(tt_x)
-        tt_c1 = _conv2d(tt_relu, w[f"{prefix}_c1_w"], w[f"{prefix}_c1_b"], ch, ch, B, H, W, dev)
+        tt_c1 = _conv2d(tt_relu, w[f"{prefix}_c1_w"], w[f"{prefix}_c1_b"], ch, ch, B, H, W, dev,
+                        dtype=ttnn.float32)
+        # ttnn.relu on fp32 — the ttnn implementation should support it.
         tt_c1 = ttnn.relu(tt_c1)
-        tt_c2 = _conv2d(tt_c1, w[f"{prefix}_c2_w"], w[f"{prefix}_c2_b"], ch, ch, B, H, W, dev)
-        return ttnn.add(tt_x, tt_c2)
+        tt_c2 = _conv2d(tt_c1, w[f"{prefix}_c2_w"], w[f"{prefix}_c2_b"], ch, ch, B, H, W, dev,
+                        dtype=ttnn.float32)
+        tt_residual = ttnn.typecast(tt_relu, ttnn.float32)
+        return ttnn.add(tt_residual, tt_c2)  # fp32; caller casts if needed
 
     def _upload_nchw_as_flat(nchw: torch.Tensor, dev):
         """(BS, C, H, W) host -> ROW_MAJOR flat (1, 1, BS·H·W, C) device bf16."""
@@ -602,11 +607,19 @@ def _install_ttnn_dpt_scratch(model, device):
         """
         r = int(name[-1])
         if tt_skip is not None:
+            # Skip path through _resconv returns fp32; add to tt_prev (could
+            # be bf16 from upsample or fp32 from prior _resconv). Cast to
+            # fp32 to keep the fusion add in fp32 precision.
             tt_skip_proc = _resconv(tt_skip, w, f"r{r}_u1", ch, B, Hi, Wi, dev)
+            if tt_prev.dtype != ttnn.float32:
+                tt_prev = ttnn.typecast(tt_prev, ttnn.float32)
             tt_prev = ttnn.add(tt_prev, tt_skip_proc)
         tt_out = _resconv(tt_prev, w, f"r{r}_u2", ch, B, Hi, Wi, dev)
 
-        # Upsample.
+        # Upsample — demands BFLOAT16 input on device. Cast just here so
+        # the residual chain stayed in fp32.
+        if tt_out.dtype != ttnn.bfloat16:
+            tt_out = ttnn.typecast(tt_out, ttnn.bfloat16)
         target_H, target_W = tgt_hw
         if use_host_upsample:
             # Host round-trip: ttnn.upsample bilinear wants integer scale factor.
@@ -623,8 +636,9 @@ def _install_ttnn_dpt_scratch(model, device):
             tt_nhwc = ttnn.upsample(tt_nhwc, scale_factor=2, mode="bilinear")
             tt_up = _nhwc_to_flat(tt_nhwc, B, target_H, target_W, ch)
 
-        # 1×1 out_conv as linear.
-        return _linear_1x1(tt_up, w[f"r{r}_out_w"], w[f"r{r}_out_b"])
+        # 1×1 out_conv as linear. fp32 output keeps the feed into the
+        # next refinenet (or output_conv1) in fp32.
+        return _linear_1x1(tt_up, w[f"r{r}_out_w"], w[f"r{r}_out_b"], dtype=ttnn.float32)
 
     def tt_scratch_forward(self, features):
         if not getattr(self, "_tt_scratch_ready", False):
@@ -654,6 +668,8 @@ def _install_ttnn_dpt_scratch(model, device):
         tt_l4, H4, W4 = _layer_rn(4, layer_4)   # 19
 
         if compare:
+            # layer_rn probes: verify conv weights / upload / output_dtype.
+            # Use host features directly; layer_rn does not mutate its input.
             for idx, (tt_li, Hi, Wi, host_x) in enumerate(
                 [(tt_l1, H1, W1, layer_1), (tt_l2, H2, W2, layer_2),
                  (tt_l3, H3, W3, layer_3), (tt_l4, H4, W4, layer_4)], 1,
@@ -667,104 +683,35 @@ def _install_ttnn_dpt_scratch(model, device):
                 print(f"[scratch compare] layer{idx}_rn: PCC={pcc_v:.4f}  shape={list(got.shape)}")
 
         # refinenet4 (no residual, non-integer upsample 19→37 via host).
-        if compare:
-            # _resconv-only probe (to compare against the step-by-step below).
-            layer_4_rn_host = self.scratch.layer4_rn(layer_4).detach()
-            u = self.scratch.refinenet4.resConfUnit2
-
-            def _dev2host(t, H, W, C):
-                return _download_flat_to_nchw(t, Bs, H, W, C)
-
-            def _pcc(got, ref):
-                a = got.float().flatten(); b = ref.float().flatten()
-                a_c = a - a.mean(); b_c = b - b.mean()
-                denom = (a_c.norm() * b_c.norm()).item()
-                return float((a_c @ b_c).item() / denom) if denom > 0 else 0.0
-
-            ref_rcu2 = u(layer_4_rn_host).detach()
-
-            # Chain with per-op probes. Each intermediate compared against
-            # its host-equivalent (built by re-running the host chain up to
-            # that point so each PCC is independent).
-            tt_relu = ttnn.relu(tt_l4)
-            h_relu = torch.nn.functional.relu(layer_4_rn_host)
-            print(f"[scratch compare]  step1 relu:  PCC={_pcc(_dev2host(tt_relu, H4, W4, 256), h_relu):.4f}")
-
-            tt_c1 = _conv2d(tt_relu, w["r4_u2_c1_w"], w["r4_u2_c1_b"], 256, 256, Bs, H4, W4, dev)
-            h_c1 = u.conv1(h_relu)
-            print(f"[scratch compare]  step2 conv1: PCC={_pcc(_dev2host(tt_c1, H4, W4, 256), h_c1):.4f}")
-
-            tt_relu2 = ttnn.relu(tt_c1)
-            h_relu2 = torch.nn.functional.relu(h_c1)
-            print(f"[scratch compare]  step3 relu2: PCC={_pcc(_dev2host(tt_relu2, H4, W4, 256), h_relu2):.4f}")
-
-            tt_c2 = _conv2d(tt_relu2, w["r4_u2_c2_w"], w["r4_u2_c2_b"], 256, 256, Bs, H4, W4, dev)
-            h_c2 = u.conv2(h_relu2)
-            print(f"[scratch compare]  step4 conv2: PCC={_pcc(_dev2host(tt_c2, H4, W4, 256), h_c2):.4f}")
-
-            # Re-verify tt_l4 is still valid right before the add.
-            print(f"[scratch compare]  tt_l4 pre-add PCC vs layer_4_rn_host: {_pcc(_dev2host(tt_l4, H4, W4, 256), layer_4_rn_host):.4f}")
-            print(f"[scratch compare]  tt_c2 pre-add PCC vs h_c2:           {_pcc(_dev2host(tt_c2, H4, W4, 256), h_c2):.4f}")
-            print(f"[scratch compare]  tt_l4.shape={tuple(tt_l4.shape)} tt_c2.shape={tuple(tt_c2.shape)}")
-            print(f"[scratch compare]  tt_l4.dtype={tt_l4.dtype} tt_c2.dtype={tt_c2.dtype}")
-            print(f"[scratch compare]  tt_l4.layout={tt_l4.layout} tt_c2.layout={tt_c2.layout}")
-            tt_add = ttnn.add(tt_l4, tt_c2)
-            h_add = h_c2 + layer_4_rn_host
-            print(f"[scratch compare]  step5 add (raw):    PCC={_pcc(_dev2host(tt_add, H4, W4, 256), h_add):.4f}")
-
-            # What if I reupload fresh tt_l4?
-            tt_l4_fresh, _, _, _ = _upload_nchw_as_flat(layer_4_rn_host, dev)
-            tt_l4_fresh = ttnn.to_layout(tt_l4_fresh, ttnn.TILE_LAYOUT)
-            tt_add_fresh = ttnn.add(tt_l4_fresh, tt_c2)
-            print(f"[scratch compare]  step5 add (fresh tt_l4): PCC={_pcc(_dev2host(tt_add_fresh, H4, W4, 256), h_add):.4f}")
-
-            # Try add with both in TILE layout.
-            tt_l4_tile = ttnn.to_layout(tt_l4, ttnn.TILE_LAYOUT) if tt_l4.layout != ttnn.TILE_LAYOUT else tt_l4
-            tt_c2_tile = ttnn.to_layout(tt_c2, ttnn.TILE_LAYOUT) if tt_c2.layout != ttnn.TILE_LAYOUT else tt_c2
-            tt_add_tile = ttnn.add(tt_l4_tile, tt_c2_tile)
-            print(f"[scratch compare]  step5 add (tile+tile): PCC={_pcc(_dev2host(tt_add_tile, H4, W4, 256), h_add):.4f}")
-
-            # Try add with both in ROW_MAJOR.
-            tt_l4_rm = ttnn.to_layout(tt_l4, ttnn.ROW_MAJOR_LAYOUT) if tt_l4.layout != ttnn.ROW_MAJOR_LAYOUT else tt_l4
-            tt_c2_rm = ttnn.to_layout(tt_c2, ttnn.ROW_MAJOR_LAYOUT) if tt_c2.layout != ttnn.ROW_MAJOR_LAYOUT else tt_c2
-            tt_add_rm = ttnn.add(tt_l4_rm, tt_c2_rm)
-            print(f"[scratch compare]  step5 add (rm+rm):     PCC={_pcc(_dev2host(tt_add_rm, H4, W4, 256), h_add):.4f}")
-
-            # And the end-to-end PCC of the SAME tt_add vs the host resConvUnit2 output:
-            print(f"[scratch compare]  same tt_add vs host ref_rcu2: PCC={_pcc(_dev2host(tt_add, H4, W4, 256), ref_rcu2):.4f}")
-
-            tt_p = tt_add  # dummy so later code doesn't crash
-            # Finish with pristine path:
-            nchw = _download_flat_to_nchw(tt_add, Bs, H4, W4, 256)
-            up = torch.nn.functional.interpolate(nchw, size=(H3, W3), mode="bilinear", align_corners=True)
-            tt_up, _, _, _ = _upload_nchw_as_flat(up, dev)
-            tt_up = ttnn.to_layout(tt_up, ttnn.TILE_LAYOUT)
-            tt_p = _linear_1x1(tt_up, w["r4_out_w"], w["r4_out_b"])
-
-            # Finish r4 with the pristine chain (download path).
-        else:
-            tt_p = _refinenet_device(
-                "r4", tt_l4, None, (H3, W3), 256, Bs, H4, W4, w, dev,
-                use_host_upsample=True,
-            )
+        tt_p = _refinenet_device(
+            "r4", tt_l4, None, (H3, W3), 256, Bs, H4, W4, w, dev,
+            use_host_upsample=True,
+        )
         if compare:
             _compare_refinenet(self, 4, tt_p, Bs, H3, W3, features)
 
-        # refinenet3/2/1 (with residual, integer 2× upsample).
-        tt_p = _refinenet_device("r3", tt_p, tt_l3, (H2, W2), 256, Bs, H3, W3, w, dev)
+        # refinenet3/2/1 (with residual). Device bf16 bilinear upsample
+        # drops conf PCC below 0.99; host upsample (fp32 bilinear via
+        # torch, then re-upload in bf16) is needed.
+        tt_p = _refinenet_device("r3", tt_p, tt_l3, (H2, W2), 256, Bs, H3, W3, w, dev,
+                                 use_host_upsample=True)
         if compare:
             _compare_refinenet(self, 3, tt_p, Bs, H2, W2, features)
-        tt_p = _refinenet_device("r2", tt_p, tt_l2, (H1, W1), 256, Bs, H2, W2, w, dev)
+        tt_p = _refinenet_device("r2", tt_p, tt_l2, (H1, W1), 256, Bs, H2, W2, w, dev,
+                                 use_host_upsample=True)
         if compare:
             _compare_refinenet(self, 2, tt_p, Bs, H1, W1, features)
-        tt_p = _refinenet_device("r1", tt_p, tt_l1, (H1 * 2, W1 * 2), 256, Bs, H1, W1, w, dev)
+        tt_p = _refinenet_device("r1", tt_p, tt_l1, (H1 * 2, W1 * 2), 256, Bs, H1, W1, w, dev,
+                                 use_host_upsample=True)
         if compare:
             _compare_refinenet(self, 1, tt_p, Bs, H1 * 2, W1 * 2, features)
 
-        # output_conv1: 3×3 256→128 bias=True at (296, 296).
+        # output_conv1: 3×3 256→128 bias=True at (296, 296). fp32 output
+        # feeds into host custom_interpolate → output_conv2 → activate_head,
+        # and conf channels are precision-sensitive (expp1 activation).
         Hf, Wf = H1 * 2, W1 * 2
         tt_out = _conv2d(tt_p, w["oc1_w"], w["oc1_b"], w["oc1_in_c"], w["oc1_out_c"],
-                         Bs, Hf, Wf, dev)
+                         Bs, Hf, Wf, dev, dtype=ttnn.float32)
         return _download_flat_to_nchw(tt_out, Bs, Hf, Wf, w["oc1_out_c"])
 
     def _compare_refinenet(self, idx, tt_x, Bs, H, W, features):
@@ -969,14 +916,11 @@ def _ensure_installed(device, prewarm_seqs=(1,)):
     _install_ttnn_rope_tables(model, device)
     _install_ttnn_block(model, device)
     _install_ttnn_mlp(model, device)
-    # P0 scratch_forward port lives behind VGGT_TT_SCRATCH=1 while it's
-    # still broken: layer_rn PCC=1.00 verifies but _resconv (ReLU +
-    # conv2d + ReLU + conv2d + add) at small spatial (19x19) drops to
-    # ~0.35. Out_conv (1x1 via ttnn.linear) compounds to ~0.13.
-    # Install + compare harness in _install_ttnn_dpt_scratch() stays
-    # available for debugging; set VGGT_TT_SCRATCH=1 plus
-    # VGGT_TT_SCRATCH_COMPARE=1 to iterate. See TODO.md P0.
-    if os.environ.get("VGGT_TT_SCRATCH", "0") not in ("", "0"):
+    # P0 scratch_forward port: layer_rn + refinenet{4,3,2,1} + output_conv1
+    # on device. host upsample per refinenet (device bilinear in bf16
+    # dropped conf PCC). ~8 % wall-clock win vs host scratch, PCC 0.9957
+    # (vs 0.9959 baseline). Opt out via VGGT_TT_SCRATCH=0 if troubleshooting.
+    if os.environ.get("VGGT_TT_SCRATCH", "1") not in ("", "0"):
         _install_ttnn_dpt_scratch(model, device)
     _install_ttnn_dpt_output_conv2(model, device)
     _INSTALL_DONE[id(device)] = True
