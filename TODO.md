@@ -15,55 +15,49 @@ Still on host (in priority order by remaining CPU time).
 
 ## Bug fixes (correctness — block further eval)
 
-### BF0 — S>2 first-forward compile stall
+### ~~BF0 — S>2 first-forward compile stall~~ ✅ RESOLVED
 
-Blocks CO3Dv2 evaluation with >2 views per scene and any real multi-image
-inference use case. Discovered during `eval_vggt.py` runs — S=2 completes
-in ~5 min for 3 scenes, S=3 and S=4 hang for 20+ min on the **first**
-forward of scene 1 and never produce output. Killing the process (`kill -9`)
-leaves the p150a chip in a bad firmware state; recovery requires
-`tt-smi -r 0 1 2 3` which also bounces the other 3 chips on the host.
-(Per-chip `tt-smi -r 2` does **not** recover — the ETH heartbeat on the
-wedged ASIC stays at `post code: c0de0000` through the re-init.)
+**Root cause (verified):** `ttnn.softmax(fp32_tensor, dim=-1)` hangs
+indefinitely on Blackhole when the sequence length N ≥ ~4122. This is
+**not** a general compile-time explosion — it is a single-op hang that
+blocked every S≥3 forward (global-attention N = S × 1374; S=3 → N=4122,
+S=4 → N=5496). Earlier hypotheses about cumulative matmul compile time
+were incorrect.
 
-Root cause (hypothesised, unverified): each `ttnn` op compiles a new
-program on first encounter of a (shape, layout, memory_config) tuple. The
-on-device Block forward hits many primitives (matmul, softmax, layer_norm,
-linear, multiply, add, slice, concat, permute, reshape, nlp_create_qkv_heads).
-S=1 primed the program cache for ~1374-token shapes; S=3 introduces ~4122
-(global-attn) + 1374 (frame-attn) × per-head and per-split variants, all
-first-time. Compile per new shape is seconds-to-tens-of-seconds; cumulative
-compile time blows up.
+**Probing (conducted with `VGGT_BLOCK_TRACE=1`):**
+- Frame attention (N=1374): 0.05s per block ✓
+- Global attention (N=5496): hung indefinitely at the softmax line.
+- Standalone probe confirmed: `ttnn.softmax(fp32, (1,16,5496,5496))` hangs.
+  `ttnn.softmax(bf16, ...)` without kcfg works (0.009s), but gives PCC
+  0.9597 per-step → end-to-end S=4 PCC 0.9867 (below 0.99 threshold).
+- Manual decomposition `max / subtract / exp / sum / reciprocal` all work
+  in fp32 at N=5496; combined they give PCC 1.000 vs fp32 reference.
 
-Candidate fixes — **options 1 and 2 partially landed; neither unblocks
-S>2 alone:**
+**Fix (landed):** In `tt_block_forward`, when N ≥ 4000 (global-attn only),
+replace the fused `ttnn.softmax` with the stable manual decomposition:
+```
+_sm    = ttnn.reshape(ttnn.max(tt_scores, dim=-1), (B,H,N,1))
+_e     = ttnn.exp(ttnn.subtract(tt_scores, _sm))
+_es    = ttnn.reshape(ttnn.sum(_e, dim=-1), (B,H,N,1))
+tt_attn = ttnn.multiply(_e, ttnn.reciprocal(_es))
+```
+The fp32 broadcast mask-add that was previously reported to hang was also
+re-probed on a clean chip and works fine (chip-state artifact, not an op
+limitation). Mask is now applied in fp32 before the decomposed softmax.
 
-1. ~~**Pre-warm at install time.**~~ **Ruled out.** S=4 prewarm hangs
-   40+ min with no progress; same compile stall, just relocated to
-   install time. Scaffolding still in `_ensure_installed(prewarm_seqs=...)`,
-   clamped to S≤2 by default.
-2. **Pad to a canonical S.** ✅ Infrastructure landed —
-   `_install_ttnn_aggregator_padding` + module-level
-   `_ACTIVE_GLOBAL_MASK` + tt_block_forward mask path. Set
-   `VGGT_S_CANON=N` to pin shapes at N. Replicates the last real
-   frame and masks global-attention key positions for padded frames
-   with `-inf`. Outputs sliced back to real S. **Validated at
-   `VGGT_S_CANON=2, S_real=1`: PCC 0.9957, same as un-padded S=1.**
-   But: **`VGGT_S_CANON=4` still hangs on the first forward (40+ min
-   timeout)** — the padding correctly pins shapes for subsequent
-   calls but the very first compile at the new shape set is the
-   slow thing, not the existence of multiple shapes. So option 2
-   alone doesn't unblock S>2 — it only helps if S_canon is
-   S-values that already compile cheaply (1 or 2).
-3. **mast3r-style pre-computed `MatmulMultiCoreReuseMultiCastProgramConfig`.**
-   Pin matmul shard strategies manually so the auto-discovery compile
-   path (which is what's actually slow — not shape-cache lookup) is
-   bypassed. Most invasive. **This is the next attack** — option 2's
-   infrastructure is ready to stack on top as soon as option 3 gets
-   the matmul compile time down from pathological to tens of seconds.
+**Results after fix:**
 
-Until option 3 lands, evaluation is stuck at S=2 / 1 pair per scene
-(coarse but functional — see `co3d_eval_results.md`).
+| S | VGGT_S_CANON | PCC    | Status | Throughput |
+|---|-------------|--------|--------|-----------|
+| 1 | (not needed) | 0.9997 | PASS | 0.32 fps |
+| 2 | (not needed) | 0.9967 | PASS | 0.41 fps |
+| 3 | 3            | 0.9989 | PASS | 0.68 fps |
+| 4 | 4            | 0.9981 | PASS | 0.64 fps |
+
+For S≥3 set `VGGT_S_CANON=S` (e.g. `VGGT_S_CANON=4 python3 test_vggt.py
+--seq 4`). First-forward at the new S prewarms in ~8s (was 20+ min hang).
+The `_install_ttnn_aggregator_padding` + `_ACTIVE_GLOBAL_MASK` infrastructure
+remains but is only needed when S_real < S_canon (padding path).
 
 ### BF1 — Hard-kill corrupts the device mesh
 

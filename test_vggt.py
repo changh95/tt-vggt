@@ -158,7 +158,7 @@ def main():
                              "chip 2 on the shared 4-chip host.")
     parser.add_argument("--prewarm-seqs", default="",
                         help="Comma-separated S values to pre-warm at install. "
-                             "Default: the --seq value. See BF0 in TODO.md.")
+                             "Default: the --seq value.")
     args = parser.parse_args()
 
     import ttnn
@@ -196,11 +196,7 @@ def main():
         if args.prewarm_seqs:
             prewarm = tuple(int(s) for s in args.prewarm_seqs.split(",") if s)
         else:
-            # BF0 note: prewarming at S>2 hits a 20+ min ttnn compile stall
-            # (prewarm-at-install does NOT relocate the stall to a safe
-            # window — the compile itself is slow). Default to known-safe
-            # values; pass --prewarm-seqs explicitly to opt in to risky S.
-            prewarm = (args.seq,) if args.seq <= 2 else (1, 2)
+            prewarm = (args.seq,)
         from tt.ttnn_vggt import _ensure_installed
         _ensure_installed(device, prewarm_seqs=prewarm)
         try:

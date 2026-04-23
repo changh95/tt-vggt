@@ -294,6 +294,18 @@ def _install_ttnn_block(model, device):
             return self._orig_forward(x, pos=pos)
 
         B, N, C = x.shape
+        import os, time as _time
+        _trace = os.environ.get("VGGT_BLOCK_TRACE", "0") not in ("", "0")
+        if _trace:
+            _t0 = _time.perf_counter()
+            _t_last = _t0
+            print(f"[block-trace] enter B={B} N={N} C={C}", flush=True)
+            def _tick(tag):
+                nonlocal _t_last
+                ttnn.synchronize_device(dev)
+                now = _time.perf_counter()
+                print(f"[block-trace]   +{now-_t_last:.3f}s {tag}", flush=True)
+                _t_last = now
         H = self._tt_heads
         Dh = self._tt_head_dim
         dev = self._tt_device
@@ -315,7 +327,9 @@ def _install_ttnn_block(model, device):
         tt_n = ttnn.layer_norm(
             tt_n, weight=self._tt_ln1_g, bias=self._tt_ln1_b, epsilon=self._tt_ln1_eps,
         )
+        if _trace: _tick("LN1")
         tt_qkv = ttnn.linear(tt_n, self._tt_qkv_w, bias=self._tt_qkv_b)
+        if _trace: _tick("qkv linear")
 
         # Split qkv on device into (q, k^T, v). nlp_create_qkv_heads wants
         # a 4D input (B, 1, N, 3*H*Dh) and returns:
@@ -326,6 +340,7 @@ def _install_ttnn_block(model, device):
         tt_q, tt_kt, tt_v = ttnn.experimental.nlp_create_qkv_heads(
             tt_qkv, num_heads=H, num_kv_heads=H, transpose_k_heads=True,
         )
+        if _trace: _tick("nlp_create_qkv_heads")
 
         # qk_norm on device (LayerNorm over head_dim).
         if self._tt_qk_norm:
@@ -345,63 +360,107 @@ def _install_ttnn_block(model, device):
         # vs global attention) and cached on the RoPE module.
         if self._tt_has_rope:
             tables = _get_rope_tables_for_pos(self.attn.rope, pos, Dh)
+            if _trace: _tick("rope tables")
             tt_q = _apply_rope_device(tt_q, tables, B, H, N, Dh)
+            if _trace: _tick("rope q")
             # k lives transposed in tt_kt; untranspose, apply RoPE, transpose.
             tt_k = ttnn.permute(tt_kt, (0, 1, 3, 2))
             tt_k = _apply_rope_device(tt_k, tables, B, H, N, Dh)
             tt_kt = ttnn.permute(tt_k, (0, 1, 3, 2))
+            if _trace: _tick("rope k")
 
         # Attention compute on device. fp32 intermediate for softmax
         # stability over the 1374-long row (bf16 collapsed conf PCC).
         tt_scores = ttnn.matmul(tt_q, tt_kt, compute_kernel_config=kcfg, dtype=ttnn.float32)
+        if _trace: _tick("Q@Kt scores")
         tt_scores = ttnn.multiply(tt_scores, 1.0 / math.sqrt(Dh))
+        if _trace: _tick("scale")
         # BF0 option 2: pad-to-canonical-S with attention mask. When the
         # Aggregator wrapper has padded input frames, it publishes an
         # additive global-attention mask (-inf on padding-frame key
         # positions). Apply only to the aggregator's global-attention
         # blocks, detected via N > _PATCH_COUNT (P=1374). Frame-attn N==P,
         # camera-trunk attn N=5 — neither gets the mask.
-        if _ACTIVE_GLOBAL_MASK is not None and _PATCH_COUNT is not None and N > _PATCH_COUNT:
-            tt_scores = ttnn.add(tt_scores, _ACTIVE_GLOBAL_MASK)
-        tt_attn = ttnn.softmax(tt_scores, dim=-1, compute_kernel_config=kcfg)
+        # BF0 softmax-at-large-N hang on Blackhole:
+        # ttnn.softmax(fp32, ...) hangs at N ≥ ~4100 (observed at N=4122,
+        # N=5496). Fix: decompose softmax into individual ops (max / sub /
+        # exp / sum / reciprocal), all of which work in fp32 at N=5496.
+        # fp32 broadcast add (1,1,1,N)→(1,H,N,N) also works (probed); the
+        # earlier session hang was chip-state, not the op itself.
+        _LARGE_SOFTMAX_N = 4000
+        if N >= _LARGE_SOFTMAX_N:
+            # Apply padding mask in fp32 — global attention only.
+            if (_ACTIVE_GLOBAL_MASK is not None
+                    and _PATCH_COUNT is not None and N > _PATCH_COUNT):
+                _gm = _ACTIVE_GLOBAL_MASK
+                if _gm.dtype != ttnn.float32:
+                    _gm = ttnn.typecast(_gm, ttnn.float32)
+                tt_scores = ttnn.add(tt_scores, _gm)
+                if _trace: _tick("mask add")
+            # Manual stable fp32 softmax: subtract row-max before exp.
+            _sm = ttnn.max(tt_scores, dim=-1)
+            _sm = ttnn.reshape(_sm, (B, H, N, 1))
+            _shifted = ttnn.subtract(tt_scores, _sm)
+            if _trace: _tick("softmax: max-sub")
+            _e = ttnn.exp(_shifted)
+            _es = ttnn.sum(_e, dim=-1)
+            _es = ttnn.reshape(_es, (B, H, N, 1))
+            tt_attn = ttnn.multiply(_e, ttnn.reciprocal(_es))
+            if _trace: _tick("softmax: exp-sum-div")
+        else:
+            tt_attn = ttnn.softmax(tt_scores, dim=-1, compute_kernel_config=kcfg)
+        if _trace: _tick("softmax")
         # Context: match the precision profile of the working (non-fused)
         # attention — fp32 intermediate then back to bf16 for the proj
         # matmul. bf16 context alone pushed world_points_conf to 0.9788.
         tt_ctx = ttnn.matmul(tt_attn, tt_v, compute_kernel_config=kcfg, dtype=ttnn.float32)
+        if _trace: _tick("attn@V")
 
         # Merge heads on device: (B, H, N, Dh) -> (B, N, H*Dh). Permute in
         # fp32 then cast to bf16 for the proj matmul.
         tt_ctx = ttnn.permute(tt_ctx, (0, 2, 1, 3))
         tt_ctx = ttnn.reshape(tt_ctx, (B, N, H * Dh))
         tt_ctx = ttnn.typecast(tt_ctx, ttnn.bfloat16)
+        if _trace: _tick("merge heads")
 
         # proj with HiFi4 + fp32 dest so the residual contribution is fp32.
         tt_attn_out = ttnn.linear(
             tt_ctx, self._tt_proj_w, bias=self._tt_proj_b,
             compute_kernel_config=kcfg, dtype=ttnn.float32,
         )
+        if _trace: _tick("proj")
         if self._tt_ls1 is not None:
             tt_attn_out = ttnn.multiply(tt_attn_out, self._tt_ls1)
         # fp32 + fp32 residual add.
         tt_x = ttnn.add(tt_x, tt_attn_out)
+        if _trace: _tick("residual1")
 
         # ---- MLP branch ----
         tt_n = ttnn.typecast(tt_x, ttnn.bfloat16)
         tt_n = ttnn.layer_norm(
             tt_n, weight=self._tt_ln2_g, bias=self._tt_ln2_b, epsilon=self._tt_ln2_eps,
         )
+        if _trace: _tick("LN2")
         tt_m = ttnn.linear(tt_n, self._tt_fc1_w, bias=self._tt_fc1_b)
+        if _trace: _tick("fc1")
         tt_m = ttnn.gelu(tt_m)
+        if _trace: _tick("gelu")
         # fc2 emits fp32 for the residual stream.
         tt_mlp = ttnn.linear(
             tt_m, self._tt_fc2_w, bias=self._tt_fc2_b,
             compute_kernel_config=kcfg, dtype=ttnn.float32,
         )
+        if _trace: _tick("fc2")
         if self._tt_ls2 is not None:
             tt_mlp = ttnn.multiply(tt_mlp, self._tt_ls2)
         tt_x = ttnn.add(tt_x, tt_mlp)
+        if _trace: _tick("residual2")
 
-        return ttnn.to_torch(tt_x).to(x.dtype)
+        result = ttnn.to_torch(tt_x).to(x.dtype)
+        if _trace:
+            _tick("download")
+            print(f"[block-trace] B={B} N={N} C={C} total={_time.perf_counter()-_t0:.3f}s", flush=True)
+        return result
 
     Block._orig_forward = Block.forward
     Block.forward = tt_block_forward
@@ -983,11 +1042,10 @@ def _install_ttnn_aggregator_padding(model, device, s_canon: int):
         if cached is not None:
             return cached
         total = s_canon * P
-        # fp32 on host to preserve -inf correctly across the cast.
+        # fp32 mask: added directly to fp32 scores in tt_block_forward.
+        # fp32 broadcast add (1,1,1,N)→(1,H,N,N) works at N=5496 (probed).
         m = torch.zeros(1, 1, 1, total, dtype=torch.float32)
         m[..., S_real * P:] = float("-inf")
-        # Upload as fp32 tile (tt_scores is fp32 at this point — see
-        # tt_block_forward). Shape broadcasts across (B, H, N_q, N_k).
         tt_m = ttnn.from_torch(m, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
         aggregator._tt_mask_cache[key] = tt_m
         return tt_m
