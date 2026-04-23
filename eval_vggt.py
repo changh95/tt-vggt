@@ -377,8 +377,7 @@ def main():
                     help="Pinned to chip 2 on the shared 4-chip host by default.")
     ap.add_argument("--prewarm-seqs", default="",
                     help="Comma-separated S values to pre-warm at install. "
-                         "Default: --num-views. Add '1' if you plan to mix "
-                         "single-view forwards. See BF0 in TODO.md.")
+                         "Default: --num-views.")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -416,10 +415,7 @@ def main():
     if args.prewarm_seqs:
         prewarm = tuple(int(s) for s in args.prewarm_seqs.split(",") if s)
     else:
-        # BF0 note: prewarming at S>2 hits a 20+ min ttnn compile stall
-        # even at install time. Default to known-safe; pass
-        # --prewarm-seqs explicitly to opt in to risky S values.
-        prewarm = (args.num_views,) if args.num_views <= 2 else (1, 2)
+        prewarm = (args.num_views,)
     try:
         _ensure_installed(device, prewarm_seqs=prewarm)
         print("# loading separate un-ported reference model")
