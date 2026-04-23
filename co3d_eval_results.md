@@ -27,7 +27,52 @@ Goal: evaluate the ttnn port of VGGT on **real data** (CO3Dv2) with two metrics:
   (not committed) that lets the RoPE cos/sin lookup handle variable S
   (recompute per pos-tensor shape, cache per shape).
 
-## Headline (12 scenes, 6 categories, S=2)
+## Headline (12 scenes, 6 categories, S=3) — BF0 fixed
+
+After fixing the `ttnn.softmax(fp32)` hang on Blackhole (BF0), S≥3 views
+work. The same 12 scenes are evaluated with **3 views → 3 pairs/scene →
+36 pairs total** (3× more pairs than the S=2 run below). Prewarm took 5.6 s.
+
+Run command: `VGGT_S_CANON=3 python3 eval_vggt.py --num-views 3 --categories apple,bottle,chair,laptop,hydrant,teddybear --co3d-root /home/ttuser/experiments/vggt/co3d_data --device-id 2`
+
+| Metric                                    | reference | port   | Δ (port − ref) |
+|-------------------------------------------|-----------|--------|---------------:|
+| mean pcc_pose_enc                         | —         | 1.0000 | (port vs ref)  |
+| mean pcc_depth                            | —         | 0.9993 | (port vs ref)  |
+| mean pcc_depth_conf                       | —         | 0.9988 | (port vs ref)  |
+| mean pcc_world_points                     | —         | 0.9996 | (port vs ref)  |
+| mean pcc_world_points_conf                | —         | 0.9995 | (port vs ref)  |
+| mean RRA@5°  (36 pairs)                   |  61.1 %   |  61.1 %|         +0.0   |
+| mean RRA@15° (36 pairs)                   |  66.7 %   |  66.7 %|         +0.0   |
+| mean RTA@5°  (36 pairs)                   |  66.7 %   |  66.7 %|         +0.0   |
+| mean RTA@15° (36 pairs)                   |  69.4 %   |  69.4 %|         +0.0   |
+| mean AUC@30° (36 pairs)                   |  66.4     |  66.3  |         −0.1   |
+| mean Chamfer (6 scenes, median-scaled)    |  0.1860   |  0.1886|        +0.0027  |
+
+Per-category:
+
+| category   | scenes | pairs | min_pcc | ref AUC30 | port AUC30 | Δ AUC30 | ref Cham | port Cham |
+|------------|-------:|------:|--------:|----------:|-----------:|--------:|---------:|----------:|
+| apple      | 3      | 9     | 0.9963  | 73.1      | 72.8       | −0.4    | 0.1555   | 0.1573    |
+| bottle     | 1      | 3     | 0.9964  | 29.4      | 28.9       | −0.6    | —        | —         |
+| chair      | 1      | 3     | 0.9990  | 32.8      | 32.8       | +0.0    | —        | —         |
+| hydrant    | 3      | 9     | 0.9983  | 79.6      | 79.6       | +0.0    | 0.2068   | 0.2111    |
+| laptop     | 1      | 3     | 0.9996  | 54.4      | 55.6       | +1.1    | —        | —         |
+| teddybear  | 3      | 9     | 0.9980  | 73.9      | 73.9       | −0.0    | 0.1956   | 0.1975    |
+
+**Takeaways:**
+- With 3× more pairs per scene, the port is **effectively tied with the
+  reference**: Δ_AUC30 = −0.1, all RRA/RTA deltas = 0.0 at both 5° and 15°.
+  The S=2 run showed −0.6 AUC30 due to small-sample variance (12 pairs).
+- All PCC channels ≥ 0.9988 on real photographs (min is `pcc_depth_conf`).
+  The `world_points_conf` channel that previously showed precision
+  sensitivity is 0.9995 — well above the 0.99 threshold.
+- **Chamfer gap unchanged** at +0.0027 (vs +0.0026 at S=2). The manual fp32
+  softmax (BF0 fix) does not regress geometry quality.
+- Throughput at S=3: **0.68 fps** on Blackhole p150a (vs 0.41 fps at S=2).
+  More views per inference, faster per-frame rate.
+
+## Headline (12 scenes, 6 categories, S=2) — historical
 
 Dataset expanded from the original 3-apple-scene run to
 **6 categories × 1–3 scenes = 12 scenes**: apple, bottle, chair, laptop,
@@ -156,26 +201,26 @@ restored the mesh).
 ## Reproducing
 
 ```bash
-cd /home/ttuser/experiments/vggt
+cd /home/ttuser/experiments/vggt/tt-vggt
 source /home/ttuser/.tenstorrent-venv/bin/activate
-python3 eval_vggt.py --num-views 2 --category apple \
-    --co3d-root co3d_data --device-id 0
+# S=3 (recommended): set VGGT_S_CANON=S for S≥3
+VGGT_S_CANON=3 python3 eval_vggt.py \
+    --num-views 3 \
+    --categories apple,bottle,chair,laptop,hydrant,teddybear \
+    --co3d-root /home/ttuser/experiments/vggt/co3d_data \
+    --device-id 2
 ```
 
-Outputs per-scene metrics and a summary table to stdout. Takes ~5 min for
-3 scenes at S=2 after the port's first-forward ttnn program compile (~2 min).
+Outputs per-scene metrics and a summary table to stdout. First forward
+prewarms the program cache in ~6 s; subsequent scenes are ~4 s each.
+Total runtime: ~12 scenes × ~4 s/scene + ~6 s prewarm ≈ 55 s.
 
 ## Next steps
 
-- Fix the S>2 compile stall (see options above) so we can run with S=4–8
-  views per scene. At 6 pairs per scene × 10 scenes, AUC@30° becomes
-  statistically meaningful rather than anecdotal.
-- Extend to more CO3D categories: the single-sequence zips are small
-  (~190 MB per category), so pulling 5 more (e.g., `bottle`, `chair`,
-  `laptop`, `hydrant`, `teddybear`) is cheap and gives a broader eval.
-- Add Chamfer distance on the `world_points` map vs CO3D's `pointcloud.ply`
-  per scene. The points are scale-ambiguous so scale alignment via
-  median-depth ratio (standard MVS-benchmark procedure) is required first.
+- ~~Fix the S>2 compile stall~~  ✅ Done (BF0 — manual fp32 softmax).
+- Run with S=4–8 views per scene for more pairs and more stable AUC.
+  At S=4 the port PASS at PCC 0.9981, throughput 0.64 fps. Command:
+  `VGGT_S_CANON=4 python3 eval_vggt.py --num-views 4 ...`
 - Add a per-scene-pair AUC plot (CDF of rotation + translation errors)
-  so the 1.1-point AUC drop can be inspected for systematic vs random
-  regressions.
+  to visualise systematic vs random regressions in the remaining −0.1
+  AUC gap.
