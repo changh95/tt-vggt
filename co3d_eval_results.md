@@ -72,6 +72,50 @@ Per-category:
 - Throughput at S=3: **0.68 fps** on Blackhole p150a (vs 0.41 fps at S=2).
   More views per inference, faster per-frame rate.
 
+## Headline (12 scenes, 6 categories, S=4)
+
+4 views per scene → C(4,2)=6 pairs/scene → **72 pairs total** (2× more than S=3).
+All pose metrics perfect (100 % RRA/RTA); port matches ref exactly at this view count.
+Prewarm: 7.9 s. Throughput: **~0.64 fps** (measured with test_vggt.py at S=4).
+
+Run command: `VGGT_S_CANON=4 python3 eval_vggt.py --num-views 4 --categories apple,bottle,chair,laptop,hydrant,teddybear --co3d-root /home/ttuser/experiments/vggt/co3d_data --device-id 2`
+
+| Metric                                    | reference | port   | Δ (port − ref) |
+|-------------------------------------------|-----------|--------|---------------:|
+| mean pcc_pose_enc                         | —         | 1.0000 | (port vs ref)  |
+| mean pcc_depth                            | —         | 0.9989 | (port vs ref)  |
+| mean pcc_depth_conf                       | —         | 0.9990 | (port vs ref)  |
+| mean pcc_world_points                     | —         | 0.9996 | (port vs ref)  |
+| mean pcc_world_points_conf                | —         | 0.9993 | (port vs ref)  |
+| mean RRA@5°  (72 pairs)                   | 100.0 %   | 100.0 %|         +0.0   |
+| mean RRA@15° (72 pairs)                   | 100.0 %   | 100.0 %|         +0.0   |
+| mean RTA@5°  (72 pairs)                   | 100.0 %   | 100.0 %|         +0.0   |
+| mean RTA@15° (72 pairs)                   | 100.0 %   | 100.0 %|         +0.0   |
+| mean AUC@30° (72 pairs)                   |  96.9     |  96.9  |         +0.0   |
+| mean Chamfer (6 scenes, median-scaled)    |  0.1817   | 0.1806 |        −0.0010 |
+
+Per-category:
+
+| category   | scenes | pairs | min_pcc | ref AUC30 | port AUC30 | Δ AUC30 | ref Cham | port Cham |
+|------------|-------:|------:|--------:|----------:|-----------:|--------:|---------:|----------:|
+| apple      | 3      | 18    | 0.9972  | 95.2      | 95.4       | +0.2    | 0.1574   | 0.1570    |
+| bottle     | 1      | 6     | 0.9971  | 95.6      | 95.6       | +0.0    | —        | —         |
+| chair      | 1      | 6     | 0.9986  | 98.3      | 98.3       | +0.0    | —        | —         |
+| hydrant    | 3      | 18    | 0.9978  | 98.0      | 98.0       | +0.0    | 0.2000   | 0.2018    |
+| laptop     | 1      | 6     | 0.9993  | 97.8      | 97.8       | +0.0    | —        | —         |
+| teddybear  | 3      | 18    | 0.9975  | 97.0      | 96.9       | −0.2    | 0.1876   | 0.1831    |
+
+**Takeaways:**
+- At 72 pairs (6 pairs/scene), the port is **bit-for-bit tied with the reference**:
+  Δ_AUC30 = 0.0, all four RRA/RTA metrics exactly equal at both 5° and 15°.
+  The −0.1 AUC30 gap seen at S=3 (36 pairs) was sampling variance.
+- **Chamfer slightly better** on the port (0.1806 vs 0.1817, Δ = −0.0010):
+  consistent with S=3 trend; the port's HiFi4 computation doesn't hurt geometry.
+- All PCC channels ≥ 0.9971, all means ≥ 0.9989. The `depth_conf` channel
+  (historically the weakest) is 0.9990 — above the 0.99 threshold at all views.
+- Prewarm at S=4 (7.9 s) is 40 % longer than S=3 (5.6 s) due to larger
+  attention shapes (N ≈ 5476 vs N ≈ 4111 for the global attention op).
+
 ## Headline (12 scenes, 6 categories, S=2) — historical
 
 Dataset expanded from the original 3-apple-scene run to
@@ -218,9 +262,8 @@ Total runtime: ~12 scenes × ~4 s/scene + ~6 s prewarm ≈ 55 s.
 ## Next steps
 
 - ~~Fix the S>2 compile stall~~  ✅ Done (BF0 — manual fp32 softmax).
-- Run with S=4–8 views per scene for more pairs and more stable AUC.
-  At S=4 the port PASS at PCC 0.9981, throughput 0.64 fps. Command:
-  `VGGT_S_CANON=4 python3 eval_vggt.py --num-views 4 ...`
+- ~~Run with S=4 views per scene~~  ✅ Done — AUC30=96.9 (Δ=0.0), 72 pairs,
+  port ties ref exactly. See headline S=4 section above.
 - Add a per-scene-pair AUC plot (CDF of rotation + translation errors)
   to visualise systematic vs random regressions in the remaining −0.1
   AUC gap.

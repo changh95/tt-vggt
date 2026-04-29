@@ -1,8 +1,8 @@
 # VGGT on p150a — Remaining Optimization Plan
 
-Current state: 1694 ms / frame, 0.59 fps, PCC 0.9959 (B=1 S=1 518×518, best-of-3).
+Current state: 1294 ms / frame, 0.773 fps, PCC 0.9957 (B=1 S=1 518×518, best-of-3).
 Baseline (pure torch CPU reference): 5037 ms / frame, 0.1985 fps.
-Total gain so far: +196% (~3× speedup).
+Total gain so far: +289% (~3.9× speedup).
 
 Ports already on p150a (commit range `c7d238e..2b2bf2d` on `changh95/vggt`):
 - Full transformer Block: norm1, qkv, q_norm/k_norm, Q·Kᵀ, softmax, ·V, merge_heads, proj, ls1, residual_add, norm2, fc1, gelu, fc2, ls2, residual_add. fp32 residual accumulator, fp32 softmax intermediate, HiFi4 + fp32 dest on proj/fc2/output_conv2.
@@ -295,25 +295,83 @@ Reference working pattern at `/home/ttuser/experiments/mast3r/tt-metal/models/de
 
 ---
 
-## P1 — DPT per-layer prelude (`norm` + `projects` + `resize_layers`)
+## P1 — DPT per-layer prelude (`norm` + `projects` + `resize_layers`) ⚠️ IMPLEMENTED, NO GAIN
 
-Remaining CPU cost: ~54 ms × 2 heads = **108 ms**.
+**Cold-bench CPU cost:** ~67 ms × 2 heads = 134 ms (measured with `torch.randn` + fresh alloc).
+**Hot-path CPU cost in actual pipeline:** ~20 ms (L3-hot data, vectorized, pipeline-overlapped).
 
-A previous port (`2b2bf2d` discard row) did `norm` + 1×1 `projects` as standalone per-op ttnn calls and netted +0 ms because each op paid its own up/down round-trip.
+### What was built
 
-### Plan
+`_install_ttnn_dpt_prelude` + `_dpt_prelude_on_device` live in `ttnn_vggt.py`.
+For each `dpt_idx` (0–3), the device path runs:
+1. Upload tokens `(Bs, 1369, 2048)` → bfloat16 TILE
+2. `ttnn.layer_norm`
+3. `ttnn.linear` (1×1 project, 2048→out_c)
+4. `ttnn.add` pos_embed `(1, 1369, out_c)` broadcast (precomputed at install)
+5. `ttnn.conv_transpose2d` (dpt_idx=0: k=4,s=4; dpt_idx=1: k=2,s=2) or Identity or `ttnn.conv2d` stride=2
+6. Download resize output → CPU → `scratch_forward` re-uploads it
 
-Fold the prelude into the device `scratch_forward` entrypoint instead of running it as isolated ops:
+**Measured result at S=1:**
 
-1. At install: preload `h.norm` LN weights, each `h.projects[i]` 1×1 conv weight (as linear matmul weight), each `h.resize_layers[i]` weight (ConvTranspose2d for `[0,1]`, Identity for `[2]`, Conv2d 3×3 s=2 for `[3]`).
-2. Rewrite the prelude loop to stay on device:
-   - Upload the 4 selected aggregated tokens once (each `(B, N, 2048)`).
-   - LN + permute/reshape + 1×1 linear + pos_embed add + resize_layer — all stay in ttnn tensors.
-   - Feed directly into `scratch_forward_device` without downloading.
-3. `pos_embed` add: the positional embedding comes from `create_uv_grid` + `position_grid_to_embed` on host. Precompute once at install for the fixed 518×518 geometry and upload as a ttnn tensor.
+| Metric     | baseline | P1 (VGGT_TT_PRELUDE=1) | Δ |
+|------------|---------|------------------------|---|
+| latency_ms | 1389    | 1395                   | +6 ms |
+| PCC        | 0.9957  | 0.9957                 | 0.0 |
+| status     | PASS    | PASS                   | — |
 
-### Expected gain
-- ~100 ms saved, but more importantly eliminates the host↔device round-trip between prelude and `scratch_forward`.
+**Why no gain:** Hot-path CPU prelude (~20 ms) ≈ device prelude overhead (8 uploads ×
+5.6 MB + conv_transpose2d + 8 downloads × 5–11 MB = ~25 ms). The PCIe round-trips
+cancel the compute savings. The cold-bench 134 ms estimate was unrepresentative
+(cache-cold allocs, no PyTorch threadpool warmup).
+
+**Disabled by default.** Enable via `VGGT_TT_PRELUDE=1` to test.
+
+### How to actually fix it
+
+The +6 ms regression comes from downloading resize outputs and then re-uploading them
+in `scratch_forward`. Eliminating the download+re-upload would save ~80 MB PCIe per
+forward (~16 ms at 5 GB/s), giving ~10 ms net win. Implement via a `_TTDeviceFeature`
+wrapper: `_dpt_prelude_on_device` returns a device tensor; `_layer_rn` in
+`tt_scratch_forward` detects it and skips the upload step. Not implemented because
+the expected gain (~10 ms, <1%) doesn't justify the complexity.
+
+---
+
+## On-device residual stream (`_TTPassed`) ✅ DONE
+
+**Measured S=1:** 1294 ms vs 1389 ms baseline — **−95 ms (−6.8%)**, PCC 0.9957 unchanged.
+
+**Root cause addressed:** Each of the 264+ Block.forward calls (DINOv2 24 + frame 24 + global 24
++ camera head 16 + …) previously did a full PCIe upload + download round-trip regardless of
+whether the result was immediately consumed by the next block. For S=1 the frame↔global reshape
+between blocks is a NOP `(1,1374,1024)→(1,1374,1024)`, so adjacent blocks see the same shape
+and the residual accumulator can stay on device.
+
+**Implementation:** `_TTPassed` proxy class wraps a device `ttnn.float32` tensor and exposes
+`.shape`, `.dtype`, `.view()`, `.reshape()`, and `__torch_function__` for `torch.cat` and
+`F.layer_norm`. In `tt_block_forward`:
+- If `_tt_can_pass=True` on the block AND `isinstance(x, _TTPassed)` AND
+  `x._logical_shape == x._shape_3d` (shape unchanged since last block) → skip the
+  `ttnn.from_torch` upload; re-use the previous block's output tensor directly.
+- Return `_TTPassed(tt_x, orig_dtype, (B,N,C))` instead of downloading.
+
+**Blocks marked `_tt_can_pass=True`:** aggregator `frame_blocks` + `global_blocks` (48 blocks),
+DINOv2 `patch_embed.blocks` (24 blocks). Camera head trunk blocks are not marked (small N=5,
+negligible PCIe).
+
+**DINOv2 fix:** `NestedTensorBlock.forward(x_or_x_list)` has `isinstance(x, Tensor)` guard that
+raises `AssertionError` for non-Tensor inputs. Patched at class level in `_install_ttnn_block`
+to short-circuit to `tt_block_forward(self, x)` when `isinstance(x, _TTPassed)`.
+
+**S>1 behaviour:** For S>1 (canonical padding mode) the frame→global reshape changes shape
+`(B*S,P,C)→(B,S*P,C)`. In that case `_logical_shape != _shape_3d` so `_use_pass=False` and the
+block materializes the `_TTPassed` (download + re-upload). Only DINOv2 blocks save PCIe at S>1.
+
+**PCIe savings (S=1):**
+- Before: 96 frame/global transfers + 48 DINOv2 transfers = 144 × 5.6 MB = 806 MB
+- After: 1 agg upload + 48 cat downloads + 1 DINOv2 upload + 1 norm download = 51 × 5.6 MB = 286 MB
+- Saved: ~520 MB → ~104 ms at 5 GB/s (measured: ~95 ms wall-clock, consistent with
+  competing device compute and PCIe contention).
 
 ---
 
@@ -356,12 +414,19 @@ Batch all of these into a single install-time preprocessing step. Upload the nor
 ## Precision-related follow-ups
 
 ### `ttnn.transformer.scaled_dot_product_attention` fused kernel
-`53d46c1` uses a manual Q·Kᵀ → softmax → ·V chain in fp32 because the fused FlashAttention-2 kernel dropped world_points_conf PCC to 0.57 for 1374-token non-causal attention with `is_causal=False`. This is either a ttnn bug at this shape or a config I missed. Worth a retry with:
-- Newer ttnn (check if Blackhole SDPA path has matured since April 2026).
-- Explicit `scale` argument instead of implicit 1/√Dh.
-- `SDPAProgramConfig` tuned for (B=1, H=16, N=1374, Dh=64).
+Retried (April 2026) with HiFi4 `compute_kernel_config` and explicit `scale=1/√Dh`.
+Layer-level probe at (1,16,1374,64): PCC vs manual = **0.999958** — excellent.
+End-to-end test result: **FAIL** — `pcc_world_points_conf` collapsed to **0.89**,
+`pcc_depth_conf` = 0.98 (both below the 0.99 threshold).
 
-A working fused SDPA could replace the manual matmul+softmax+matmul chain and likely save 50–150 ms.
+Root cause: FlashAttention-2 computes softmax in bf16 internally even with
+`fp32_dest_acc_en=True`. VGGT's conf channels pass through `expp1` in
+`activate_head` which is highly sensitive to small precision errors accumulated
+over 24 blocks. The fp32 Q@Kt + fp32 softmax + fp32 @V path is mandatory.
+
+Upside: SDPA run was 1214ms vs 1389ms baseline (**−175ms, −12.6%**). That
+savings exists if a fp32-accurate SDPA path ever lands on Blackhole. Track as a
+long-term item; do not re-try without a fp32-softmax SDPA API change.
 
 ### `matmul.program_config` tuning
 The 1024→3072 qkv and 1024→4096 fc1 matmuls are generic DRAM-interleaved runs. Pre-sharding weights and using a block-matmul program_config could improve Tensix utilisation. Worth an hour of experimentation per big matmul shape.

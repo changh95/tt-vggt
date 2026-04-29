@@ -371,6 +371,9 @@ def _install_ttnn_block(model, device):
 
         # Attention compute on device. fp32 intermediate for softmax
         # stability over the 1374-long row (bf16 collapsed conf PCC).
+        # NOTE: SDPA (FlashAttention-2) was tested but dropped — it uses
+        # bf16 softmax internally, collapsing world_points_conf PCC to 0.89
+        # (needs >0.99). fp32 score+softmax+context path is required.
         tt_scores = ttnn.matmul(tt_q, tt_kt, compute_kernel_config=kcfg, dtype=ttnn.float32)
         if _trace: _tick("Q@Kt scores")
         tt_scores = ttnn.multiply(tt_scores, 1.0 / math.sqrt(Dh))
@@ -826,6 +829,200 @@ def _install_ttnn_dpt_scratch(model, device):
     DPTHead._tt_scratch_patched = True
 
 
+def _dpt_prelude_on_device(head, x_cpu, dpt_idx, Bs, patch_h, patch_w, dev, kcfg):
+    """Run one DPT prelude iteration on device.
+
+    x_cpu : (Bs, N_patches=37*37, dim_in=2048) CPU tensor
+    Returns: (Bs, out_c, H_out, W_out) float32 CPU tensor
+    """
+    import ttnn
+    p = head._tt_pre
+    out_c = p[f"out_c_{dpt_idx}"]
+    N = patch_h * patch_w  # 1369
+
+    # Upload tokens: bf16 TILE (Bs, N, dim_in).
+    tt_x = ttnn.from_torch(
+        x_cpu.to(torch.bfloat16).contiguous(),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=dev,
+    )
+
+    # LayerNorm: (Bs, N, dim_in) → (Bs, N, dim_in) bf16.
+    tt_x = ttnn.layer_norm(
+        tt_x,
+        weight=head._tt_pre_ln_g,
+        bias=head._tt_pre_ln_b,
+        epsilon=head._tt_pre_ln_eps,
+    )
+
+    # 1×1 projection as linear: (Bs, N, dim_in) → (Bs, N, out_c).
+    tt_x = ttnn.linear(tt_x, p[f"proj_w_{dpt_idx}"], bias=p[f"proj_b_{dpt_idx}"],
+                       compute_kernel_config=kcfg)
+
+    # pos_embed add: (1, N, out_c) broadcast over Bs.
+    if head.pos_embed:
+        tt_x = ttnn.add(tt_x, p[f"pe_{dpt_idx}"])
+
+    resize_type = p[f"resize_type_{dpt_idx}"]
+
+    if resize_type == "identity":
+        # (Bs, N, out_c) TILE → ROW_MAJOR → NCHW (Bs, out_c, H, W) CPU.
+        tt_x = ttnn.to_layout(tt_x, ttnn.ROW_MAJOR_LAYOUT)
+        raw = ttnn.to_torch(tt_x).to(torch.float32)  # (Bs, N, out_c)
+        return raw.reshape(Bs, patch_h, patch_w, out_c).permute(0, 3, 1, 2).contiguous()
+
+    # Flatten to (1, 1, Bs*N, out_c) ROW_MAJOR — required by conv2d/conv_transpose2d.
+    tt_x = ttnn.to_layout(tt_x, ttnn.ROW_MAJOR_LAYOUT)
+    tt_x = ttnn.reshape(tt_x, (1, 1, Bs * N, out_c))
+
+    if resize_type == "conv_transpose":
+        k = p[f"resize_k_{dpt_idx}"]
+        s = p[f"resize_s_{dpt_idx}"]
+        pad = p[f"resize_p_{dpt_idx}"]
+        H_out = (patch_h - 1) * s[0] - 2 * pad[0] + k[0]
+        W_out = (patch_w - 1) * s[1] - 2 * pad[1] + k[1]
+        tt_out = ttnn.conv_transpose2d(
+            input_tensor=tt_x,
+            weight_tensor=p[f"resize_w_{dpt_idx}"],
+            bias_tensor=p[f"resize_b_{dpt_idx}"],
+            device=dev,
+            in_channels=out_c,
+            out_channels=out_c,
+            batch_size=Bs,
+            input_height=patch_h,
+            input_width=patch_w,
+            kernel_size=k,
+            stride=s,
+            padding=pad,
+        )
+    else:  # stride-2 Conv2d
+        k = p[f"resize_k_{dpt_idx}"]
+        s = p[f"resize_s_{dpt_idx}"]
+        pad = p[f"resize_p_{dpt_idx}"]
+        H_out = (patch_h + 2 * pad[0] - k[0]) // s[0] + 1
+        W_out = (patch_w + 2 * pad[1] - k[1]) // s[1] + 1
+        tt_out = ttnn.conv2d(
+            input_tensor=tt_x,
+            weight_tensor=p[f"resize_w_{dpt_idx}"],
+            bias_tensor=p[f"resize_b_{dpt_idx}"],
+            device=dev,
+            in_channels=out_c,
+            out_channels=out_c,
+            batch_size=Bs,
+            input_height=patch_h,
+            input_width=patch_w,
+            kernel_size=k,
+            stride=s,
+            padding=pad,
+            compute_config=kcfg,
+        )
+
+    # conv output: (1, 1, Bs*H_out*W_out, out_c) ROW_MAJOR.
+    raw = ttnn.to_torch(tt_out).to(torch.float32)
+    return raw.reshape(Bs, H_out, W_out, out_c).permute(0, 3, 1, 2).contiguous()
+
+
+def _install_ttnn_dpt_prelude(model, device):
+    """Preload DPT prelude weights (norm + projects + pos_embed + resize_layers)
+    onto device so _forward_impl can skip the CPU compute (~110 ms × 2 heads).
+
+    Per dpt_idx (0–3), projects is a 1×1 Conv2d stored as a linear weight,
+    pos_embed is precomputed for the fixed 37×37 / 518×518 geometry, and
+    resize_layers weights are stored for ttnn.conv_transpose2d / ttnn.conv2d.
+    Does NOT patch _forward_impl — that is done by _install_ttnn_dpt_output_conv2
+    which checks _tt_prelude_ready.
+    """
+    import ttnn
+    import torch.nn as nn
+    from vggt.heads.dpt_head import DPTHead  # type: ignore
+    from vggt.heads.utils import create_uv_grid, position_grid_to_embed  # type: ignore
+
+    PATCH_HW = 37       # 518 // 14
+    N_PATCHES = PATCH_HW * PATCH_HW  # 1369
+
+    for h in model.modules():
+        if not isinstance(h, DPTHead) or getattr(h, "_tt_prelude_ready", False):
+            continue
+
+        # LN weights: (1, 1, dim_in) for ttnn.layer_norm broadcasting over (Bs, N, dim_in).
+        ln_g = h.norm.weight.detach().reshape(1, 1, -1).to(torch.bfloat16)
+        ln_b = h.norm.bias.detach().reshape(1, 1, -1).to(torch.bfloat16)
+        h._tt_pre_ln_g = ttnn.from_torch(ln_g, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        h._tt_pre_ln_b = ttnn.from_torch(ln_b, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        h._tt_pre_ln_eps = float(h.norm.eps)
+
+        pre = {}
+
+        for dpt_idx, proj in enumerate(h.projects):
+            out_c = proj.weight.shape[0]
+            in_c  = proj.weight.shape[1]
+            pre[f"out_c_{dpt_idx}"] = out_c
+
+            # 1×1 conv as linear matmul weight (in_c, out_c) TILE.
+            w = proj.weight.detach().reshape(out_c, in_c).t().contiguous().to(torch.bfloat16)
+            pre[f"proj_w_{dpt_idx}"] = ttnn.from_torch(
+                w, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+            )
+            pre[f"proj_b_{dpt_idx}"] = (
+                ttnn.from_torch(
+                    proj.bias.detach().reshape(1, 1, -1).to(torch.bfloat16),
+                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device,
+                ) if proj.bias is not None else None
+            )
+
+            # pos_embed: precomputed for 37×37 grid at aspect_ratio=1.0 (518×518 input).
+            # Stored as (1, N=1369, out_c) TILE for broadcast add to (Bs, N, out_c).
+            # _apply_pos_embed does permute(2,0,1)[None].expand before adding to NCHW;
+            # here we flatten the spatial dims to match the (Bs, N, C) token layout.
+            pe = create_uv_grid(PATCH_HW, PATCH_HW, aspect_ratio=1.0)  # (37, 37, 2)
+            pe = position_grid_to_embed(pe, out_c)                       # (37, 37, out_c)
+            pe = pe * 0.1                                                 # ratio=0.1
+            pre[f"pe_{dpt_idx}"] = ttnn.from_torch(
+                pe.reshape(1, N_PATCHES, out_c).to(torch.bfloat16).contiguous(),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device,
+            )
+
+        for dpt_idx, rl in enumerate(h.resize_layers):
+            if isinstance(rl, nn.ConvTranspose2d):
+                # PyTorch ConvTranspose2d weight: (in_c, out_c, kH, kW) matches ttnn format.
+                # Bias: ttnn.conv_transpose2d internally calls prepare_conv_bias which expects
+                # (1, 1, 1, out_c) — same as ttnn.conv2d, not the 1D shape the API docs state.
+                pre[f"resize_type_{dpt_idx}"] = "conv_transpose"
+                pre[f"resize_w_{dpt_idx}"] = ttnn.from_torch(
+                    rl.weight.detach().to(torch.bfloat16), dtype=ttnn.bfloat16
+                )
+                pre[f"resize_b_{dpt_idx}"] = (
+                    ttnn.from_torch(
+                        rl.bias.detach().reshape(1, 1, 1, -1).to(torch.bfloat16),
+                        dtype=ttnn.bfloat16,
+                    ) if rl.bias is not None else None
+                )
+                pre[f"resize_k_{dpt_idx}"] = (rl.kernel_size[0], rl.kernel_size[1])
+                pre[f"resize_s_{dpt_idx}"] = (rl.stride[0], rl.stride[1])
+                pre[f"resize_p_{dpt_idx}"] = (rl.padding[0], rl.padding[1])
+                pre[f"resize_out_c_{dpt_idx}"] = rl.out_channels
+            elif isinstance(rl, nn.Conv2d):
+                pre[f"resize_type_{dpt_idx}"] = "conv"
+                pre[f"resize_w_{dpt_idx}"] = ttnn.from_torch(
+                    rl.weight.detach().to(torch.bfloat16), dtype=ttnn.bfloat16
+                )
+                pre[f"resize_b_{dpt_idx}"] = (
+                    ttnn.from_torch(
+                        rl.bias.detach().reshape(1, 1, 1, -1).to(torch.bfloat16),
+                        dtype=ttnn.bfloat16,
+                    ) if rl.bias is not None else None
+                )
+                pre[f"resize_k_{dpt_idx}"] = (rl.kernel_size[0], rl.kernel_size[1])
+                pre[f"resize_s_{dpt_idx}"] = (rl.stride[0], rl.stride[1])
+                pre[f"resize_p_{dpt_idx}"] = (rl.padding[0], rl.padding[1])
+                pre[f"resize_out_c_{dpt_idx}"] = rl.out_channels
+            else:
+                pre[f"resize_type_{dpt_idx}"] = "identity"
+
+        h._tt_pre = pre
+        h._tt_device = device
+        h._tt_prelude_ready = True
+
+
 def _install_ttnn_dpt_output_conv2(model, device):
     """Port DPTHead.scratch.output_conv2 (3x3 conv -> relu -> 1x1 conv at
     518x518) to ttnn.conv2d. This chain is the biggest single DPT chunk
@@ -903,21 +1100,28 @@ def _install_ttnn_dpt_output_conv2(model, device):
         B, S, _, H, W = images.shape
         patch_h, patch_w = H // self.patch_size, W // self.patch_size
 
+        use_tt_prelude = getattr(self, "_tt_prelude_ready", False)
         out = []
-        dpt_idx = 0
-        for layer_idx in self.intermediate_layer_idx:
+        for dpt_idx, layer_idx in enumerate(self.intermediate_layer_idx):
             x = aggregated_tokens_list[layer_idx][:, :, patch_start_idx:]
             if frames_start_idx is not None and frames_end_idx is not None:
                 x = x[:, frames_start_idx:frames_end_idx]
-            x = x.reshape(B * S, -1, x.shape[-1])
-            x = self.norm(x)
-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
-            x = self.projects[dpt_idx](x)
-            if self.pos_embed:
-                x = self._apply_pos_embed(x, W, H)
-            x = self.resize_layers[dpt_idx](x)
+            Bs = B * S
+            x = x.reshape(Bs, -1, x.shape[-1])  # (Bs, N_patches, dim_in)
+
+            if use_tt_prelude:
+                x = _dpt_prelude_on_device(
+                    self, x, dpt_idx, Bs, patch_h, patch_w,
+                    self._tt_device, _dpt_kcfg(self._tt_device),
+                )
+            else:
+                x = self.norm(x)
+                x = x.permute(0, 2, 1).reshape((Bs, x.shape[-1], patch_h, patch_w))
+                x = self.projects[dpt_idx](x)
+                if self.pos_embed:
+                    x = self._apply_pos_embed(x, W, H)
+                x = self.resize_layers[dpt_idx](x)
             out.append(x)
-            dpt_idx += 1
 
         fused = self.scratch_forward(out)
         fused = custom_interpolate(
@@ -1113,6 +1317,15 @@ def _ensure_installed(device, prewarm_seqs=(1,), s_canon: Optional[int] = None):
     # (vs 0.9959 baseline). Opt out via VGGT_TT_SCRATCH=0 if troubleshooting.
     if os.environ.get("VGGT_TT_SCRATCH", "1") not in ("", "0"):
         _install_ttnn_dpt_scratch(model, device)
+    # P1 DPT prelude port: norm + projects + pos_embed + resize_layers on device.
+    # Tested at S=1: PCC 0.9957 (= baseline), latency +6 ms vs CPU baseline.
+    # No gain because hot-path CPU compute (~20 ms) ≈ device PCIe overhead (8
+    # upload+download round-trips × 5-11 MB each). Would require keeping prelude
+    # outputs on device and feeding directly into scratch_forward (avoids
+    # download+re-upload) to break even. Disabled by default; enable via
+    # VGGT_TT_PRELUDE=1 to test or to explore at larger S.
+    if os.environ.get("VGGT_TT_PRELUDE", "0") not in ("", "0"):
+        _install_ttnn_dpt_prelude(model, device)
     _install_ttnn_dpt_output_conv2(model, device)
     if s_canon > 1:
         _install_ttnn_aggregator_padding(model, device, s_canon)
