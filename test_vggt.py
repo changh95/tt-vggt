@@ -22,26 +22,25 @@ import sys
 import time
 import traceback
 
-# Our tt-metal build is at experiments/vggt/tt-metal. The venv ttnn is
-# pinned to pi0_5's checkout (without matching kernel source), so reuse
-# medgemma's tt-metal the way sibling experiments (mast3r) do.
-_TT_METAL_ROOT = "/home/ttuser/experiments/medgemma/tt-metal"
-if _TT_METAL_ROOT not in sys.path:
+# Import roots. In the tt-model image PYTHONPATH=/opt/tt-metal already covers
+# ttnn, this repo's `models` package and the upstream `vggt` package. On a host,
+# set TT_METAL_HOME to the built tt-metal tree (added to sys.path here) and, if
+# the pinned facebookresearch/vggt checkout is not already importable, VGGT_REF.
+_CODE_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _CODE_ROOT not in sys.path:
+    sys.path.insert(0, _CODE_ROOT)
+_TT_METAL_ROOT = os.environ.get("TT_METAL_HOME")
+if _TT_METAL_ROOT and _TT_METAL_ROOT not in sys.path:
     sys.path.insert(0, _TT_METAL_ROOT)
     sys.path.insert(1, os.path.join(_TT_METAL_ROOT, "ttnn"))
     sys.path.insert(2, os.path.join(_TT_METAL_ROOT, "tools"))
-os.chdir(_TT_METAL_ROOT)
-
-# Model code lives under this experiment's tt-metal tree. Put the demo
-# dir directly on sys.path so imports stay short ("reference.*", "tt.*")
-# and don't collide with medgemma's sibling models/ tree.
-_VGGT_DEMO = "/home/ttuser/experiments/vggt/tt-metal/models/demos/vggt"
-if _VGGT_DEMO not in sys.path:
-    sys.path.insert(0, _VGGT_DEMO)
+_VGGT_REF = os.environ.get("VGGT_REF")
+if _VGGT_REF and _VGGT_REF not in sys.path:
+    sys.path.insert(0, _VGGT_REF)
 
 import torch  # noqa: E402
 
-from reference.torch_vggt import load_vggt  # noqa: E402
+from models.demos.vggt.reference.torch_vggt import load_vggt  # noqa: E402
 
 
 def pcc(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -119,7 +118,7 @@ _PCC_KEYS = ("depth", "depth_conf", "world_points", "world_points_conf", "pose_e
 
 
 def run_end_to_end(device, runs: int, batch: int, seq: int, img_size: int):
-    from tt.ttnn_vggt import vggt_forward as tt_vggt_forward
+    from models.demos.vggt.tt.ttnn_vggt import vggt_forward as tt_vggt_forward
 
     images = _make_inputs(batch, seq, img_size)
     ref_model = load_vggt(eval_mode=True)
@@ -153,9 +152,9 @@ def main():
     parser.add_argument("--seq", type=int, default=1,
                         help="Number of views (S). VGGT supports variable S.")
     parser.add_argument("--img-size", type=int, default=518)
-    parser.add_argument("--device-id", type=int, default=2,
-                        help="Tenstorrent UMD chip id. This project is pinned to "
-                             "chip 2 on the shared 4-chip host.")
+    parser.add_argument("--device-id", type=int,
+                        default=int(os.environ.get("TT_DEVICE_ID", "0")),
+                        help="Tenstorrent UMD chip id (default: $TT_DEVICE_ID or 0).")
     parser.add_argument("--prewarm-seqs", default="",
                         help="Comma-separated S values to pre-warm at install. "
                              "Default: the --seq value.")
@@ -163,7 +162,9 @@ def main():
 
     import ttnn
 
-    device = ttnn.open_device(device_id=args.device_id, l1_small_size=32 * 1024)
+    from models.demos.vggt.tt.ttnn_vggt import trace_region_bytes as _trace_bytes, l1_small_bytes as _l1_small
+    _trace_kw = {"trace_region_size": _trace_bytes()} if _trace_bytes() else {}  # TT_FUSED=1 only
+    device = ttnn.open_device(device_id=args.device_id, l1_small_size=_l1_small(), **_trace_kw)  # 32 KiB unless TT_FUSED=1
     if os.environ.get("VGGT_NO_PROGRAM_CACHE", "0") not in ("", "0"):
         print("[test_vggt] program cache disabled via VGGT_NO_PROGRAM_CACHE", flush=True)
     elif hasattr(device, "enable_program_cache"):
@@ -197,7 +198,7 @@ def main():
             prewarm = tuple(int(s) for s in args.prewarm_seqs.split(",") if s)
         else:
             prewarm = (args.seq,)
-        from tt.ttnn_vggt import _ensure_installed
+        from models.demos.vggt.tt.ttnn_vggt import _ensure_installed
         _ensure_installed(device, prewarm_seqs=prewarm)
         try:
             pcc_val, per_key, latency_ms = LAYER_DISPATCH[args.layer](

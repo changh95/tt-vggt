@@ -22,3 +22,4 @@ co3d_data/
 # ---- reference code cloned separately ----
 vggt_ref/
 tt-metal/
+generated/

@@ -38,6 +38,14 @@ Precision profile:
     dtype=float32. bf16 softmax over 1374-long rows dropped conf PCC
     below 0.99.
   - proj, fc2, DPT output_conv2: HiFi4 + fp32 dest acc.
+
+TT_FUSED (default 1 since the 2026-09-13 p150a validation; read once in `_ensure_installed`): instead of the class-level
+monkey patches above, `vggt_forward` runs the device-resident `TtVggt` wrapper in
+`ttnn_vggt_fused.py` -- one metal trace per S with a persistent input buffer, the
+fp32 residual stream never leaving the device, the RoPE / head-split / scale-fold
+reformulations (exact, see `fused_tables.py`) and the whole DPT chain on device.
+With the knob unset (default) nothing in this file changes and the legacy path is
+bit-for-bit the shipped behaviour.
 """
 from __future__ import annotations
 
@@ -51,6 +59,12 @@ _CACHED_MODEL = None
 _INSTALL_DONE: dict = {}
 _HIFI_KCONFIG = None
 
+# TT_FUSED=1 state: the decision is taken ONCE in `_ensure_installed` (never re-read per
+# forward) and the device-resident wrapper lives here.  `_FUSED_ACTIVE is None` = not decided
+# yet, False = legacy monkey-patch path, True = `_FUSED_MODEL` (a `TtVggt`) serves forwards.
+_FUSED_ACTIVE: Optional[bool] = None
+_FUSED_MODEL = None
+
 # BF0 option 2 state: pad S to a canonical size so ttnn program-cache only
 # ever sees one set of shapes. When padding is active, global attention
 # needs an additive mask with -inf on the padding frames' key positions.
@@ -62,9 +76,42 @@ _PATCH_COUNT = None  # P = patches + special tokens (1374 for VGGT @ 518x518 pat
 def _get_model():
     global _CACHED_MODEL
     if _CACHED_MODEL is None:
-        from reference.torch_vggt import load_vggt
+        # Absolute package import: works with PYTHONPATH=/opt/tt-metal in the
+        # tt-model image and with <repo>/code on PYTHONPATH on a host.
+        from models.demos.vggt.reference.torch_vggt import load_vggt
         _CACHED_MODEL = load_vggt(eval_mode=True)
     return _CACHED_MODEL
+
+
+def fused_enabled() -> bool:
+    """The `TT_FUSED` knob as it applies to THIS process: the value fixed by
+    `_ensure_installed` once it ran, otherwise the current environment."""
+    if _FUSED_ACTIVE is not None:
+        return bool(_FUSED_ACTIVE)
+    from models.demos.vggt.tt.fused_tables import fused_enabled as _read
+    return _read()
+
+
+def trace_region_bytes() -> int:
+    """`trace_region_size` the device must be opened with: 0 (legacy, unchanged) when
+    `TT_FUSED=0`; with the fused default `VGGT_TRACE_REGION_MB` MiB (1536) so several traces coexist
+    in a pre-allocated region (tt-metal TraceCorrectness: dynamic trace storage is unsafe
+    with multiple traces)."""
+    from models.demos.vggt.tt.fused_tables import trace_region_bytes as _bytes
+    return _bytes()
+
+
+def l1_small_bytes() -> int:
+    """`l1_small_size` for `ttnn.open_device`: 32 KiB (the port's value) with `TT_FUSED=0`, else
+    then `VGGT_L1_SMALL_KB` KiB (default 64; conv2d config tensors of the on-device DPT chain
+    live there)."""
+    from models.demos.vggt.tt.fused_tables import l1_small_bytes as _bytes
+    return _bytes()
+
+
+def fused_model():
+    """The live `TtVggt` wrapper (TT_FUSED=1 after `_ensure_installed`) or None."""
+    return _FUSED_MODEL
 
 
 def _hifi_kconfig(device):
@@ -1293,10 +1340,28 @@ def _install_ttnn_aggregator_padding(model, device, s_canon: int):
 
 
 def _ensure_installed(device, prewarm_seqs=(1,), s_canon: Optional[int] = None):
+    global _FUSED_ACTIVE, _FUSED_MODEL
     if _INSTALL_DONE.get(id(device)):
         return
     import os
     model = _get_model()
+
+    if _FUSED_ACTIVE is None:
+        from models.demos.vggt.tt.fused_tables import fused_enabled as _read_knob
+        _FUSED_ACTIVE = bool(_read_knob())
+    if _FUSED_ACTIVE:
+        # TT_FUSED=1: device-resident wrapper + one trace per S.  The pad-to-canonical-S
+        # machinery is unnecessary here (every S gets its own trace at warm-up), so
+        # VGGT_S_CANON=N simply means "warm and capture S = 1..N".
+        from models.demos.vggt.tt.ttnn_vggt_fused import TtVggt
+        if s_canon is None:
+            s_canon = int(os.environ.get("VGGT_S_CANON", "1") or "1")
+        seqs = tuple(range(1, s_canon + 1)) if s_canon > 1 else tuple(prewarm_seqs or (1,))
+        if _FUSED_MODEL is None:
+            _FUSED_MODEL = TtVggt(model, device)
+        _INSTALL_DONE[id(device)] = True
+        _FUSED_MODEL.warm(seqs)
+        return
 
     # BF0 option 2: pad-to-canonical-S. Set VGGT_S_CANON (or pass
     # s_canon=N explicitly) to run the aggregator at S=N always,
@@ -1343,6 +1408,51 @@ def vggt_forward(images: torch.Tensor, device: Any = None,
     if device is None:
         raise RuntimeError("ttnn device handle required")
     _ensure_installed(device, prewarm_seqs=prewarm_seqs)
+    if _FUSED_ACTIVE and _FUSED_MODEL is not None:
+        if query_points is not None:
+            raise NotImplementedError("TT_FUSED=1: the track head is not part of the device graph")
+        with torch.no_grad():
+            return _FUSED_MODEL(images)
     model = _get_model()
     with torch.no_grad():
         return model(images, query_points=query_points)
+
+
+def release_device_state() -> int:
+    """Drop every ttnn tensor the install step attached to the torch model
+    (block weights, RoPE lookup tables, padding masks, DPT conv weights) and
+    reset the module-level install caches, so the device can be closed
+    cleanly afterwards. Returns the number of attributes released.
+
+    Call this from a server's shutdown path BEFORE ``ttnn.close_device``:
+    device buffers whose Python owners outlive the device are freed after
+    the allocator is gone. The class-level monkey patches stay in place; a
+    later ``_ensure_installed`` on a new device re-uploads everything.
+    """
+    global _CACHED_MODEL, _INSTALL_DONE, _HIFI_KCONFIG, _ACTIVE_GLOBAL_MASK, _PATCH_COUNT
+    global _FUSED_ACTIVE, _FUSED_MODEL
+    import gc
+    released = 0
+    if _FUSED_MODEL is not None:
+        try:
+            released += _FUSED_MODEL.release()   # release traces + drop device tensors first
+        finally:
+            _FUSED_MODEL = None
+    _FUSED_ACTIVE = None
+    model = _CACHED_MODEL
+    if model is not None:
+        for m in model.modules():
+            for name in [n for n in list(vars(m)) if n.startswith("_tt_")]:
+                val = getattr(m, name)
+                if isinstance(val, dict):
+                    released += len(val)
+                    val.clear()
+                delattr(m, name)
+                released += 1
+    _INSTALL_DONE.clear()
+    _HIFI_KCONFIG = None
+    _ACTIVE_GLOBAL_MASK = None
+    _PATCH_COUNT = None
+    _CACHED_MODEL = None
+    gc.collect()
+    return released

@@ -9,15 +9,21 @@ import os
 import sys
 from pathlib import Path
 
-_TT_METAL_ROOT = "/home/ttuser/experiments/medgemma/tt-metal"
-if _TT_METAL_ROOT not in sys.path:
+# Import roots. In the tt-model image PYTHONPATH=/opt/tt-metal already covers
+# ttnn, this repo's `models` package and the upstream `vggt` package. On a host,
+# set TT_METAL_HOME to the built tt-metal tree (added to sys.path here) and, if
+# the pinned facebookresearch/vggt checkout is not already importable, VGGT_REF.
+_CODE_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _CODE_ROOT not in sys.path:
+    sys.path.insert(0, _CODE_ROOT)
+_TT_METAL_ROOT = os.environ.get("TT_METAL_HOME")
+if _TT_METAL_ROOT and _TT_METAL_ROOT not in sys.path:
     sys.path.insert(0, _TT_METAL_ROOT)
     sys.path.insert(1, os.path.join(_TT_METAL_ROOT, "ttnn"))
-os.chdir(_TT_METAL_ROOT)
-_VGGT_DEMO = "/home/ttuser/experiments/vggt/tt-metal/models/demos/vggt"
-sys.path.insert(0, _VGGT_DEMO)
-_VGGT_REF = "/home/ttuser/experiments/vggt/vggt_ref"
-sys.path.insert(0, _VGGT_REF)
+    sys.path.insert(2, os.path.join(_TT_METAL_ROOT, "tools"))
+_VGGT_REF = os.environ.get("VGGT_REF")
+if _VGGT_REF and _VGGT_REF not in sys.path:
+    sys.path.insert(0, _VGGT_REF)
 
 import numpy as np
 import torch
@@ -32,16 +38,27 @@ from vggt.utils.load_fn import load_and_preprocess_images  # noqa: E402
 
 
 def main():
-    img_src = Path("/home/ttuser/experiments/vggt/vggt_ref/examples/kitchen/images/00.png")
-    media_dir = Path("/home/ttuser/experiments/vggt/tt-vggt/media")
+    # Source frame: $VGGT_DEMO_IMAGE, else the upstream kitchen example when
+    # $VGGT_REF is set, else this repo's media/input.png. Output: $VGGT_MEDIA_DIR
+    # or <repo>/media.
+    repo_root = Path(_CODE_ROOT).parent
+    if os.environ.get("VGGT_DEMO_IMAGE"):
+        img_src = Path(os.environ["VGGT_DEMO_IMAGE"])
+    elif _VGGT_REF:
+        img_src = Path(_VGGT_REF) / "examples" / "kitchen" / "images" / "00.png"
+    else:
+        img_src = repo_root / "media" / "input.png"
+    media_dir = Path(os.environ.get("VGGT_MEDIA_DIR", repo_root / "media"))
     media_dir.mkdir(exist_ok=True)
 
     images = load_and_preprocess_images([str(img_src)], mode="pad")  # (1, 3, 518, 518)
     images_bSCHW = images.unsqueeze(0)  # (B=1, S=1, 3, 518, 518)
 
     import ttnn
-    from tt.ttnn_vggt import vggt_forward, _ensure_installed
-    device = ttnn.open_device(device_id=2, l1_small_size=32 * 1024)
+    from models.demos.vggt.tt.ttnn_vggt import vggt_forward, _ensure_installed, trace_region_bytes, l1_small_bytes
+    _trace_kw = {"trace_region_size": trace_region_bytes()} if trace_region_bytes() else {}  # TT_FUSED=1 only
+    device = ttnn.open_device(device_id=int(os.environ.get("TT_DEVICE_ID", "0")),
+                              l1_small_size=l1_small_bytes(), **_trace_kw)  # 32 KiB unless TT_FUSED=1
     if hasattr(device, "enable_program_cache"):
         device.enable_program_cache()
     try:

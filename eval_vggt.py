@@ -33,25 +33,26 @@ import time
 import traceback
 from pathlib import Path
 
-# Match test_vggt.py's import shim: use medgemma's tt-metal build + point at
-# our demo tree.
-_TT_METAL_ROOT = "/home/ttuser/experiments/medgemma/tt-metal"
-if _TT_METAL_ROOT not in sys.path:
+# Import roots. In the tt-model image PYTHONPATH=/opt/tt-metal already covers
+# ttnn, this repo's `models` package and the upstream `vggt` package. On a host,
+# set TT_METAL_HOME to the built tt-metal tree (added to sys.path here) and, if
+# the pinned facebookresearch/vggt checkout is not already importable, VGGT_REF.
+_CODE_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _CODE_ROOT not in sys.path:
+    sys.path.insert(0, _CODE_ROOT)
+_TT_METAL_ROOT = os.environ.get("TT_METAL_HOME")
+if _TT_METAL_ROOT and _TT_METAL_ROOT not in sys.path:
     sys.path.insert(0, _TT_METAL_ROOT)
     sys.path.insert(1, os.path.join(_TT_METAL_ROOT, "ttnn"))
     sys.path.insert(2, os.path.join(_TT_METAL_ROOT, "tools"))
-os.chdir(_TT_METAL_ROOT)
-_VGGT_DEMO = "/home/ttuser/experiments/vggt/tt-metal/models/demos/vggt"
-if _VGGT_DEMO not in sys.path:
-    sys.path.insert(0, _VGGT_DEMO)
-_VGGT_REF = "/home/ttuser/experiments/vggt/vggt_ref"
-if _VGGT_REF not in sys.path:
+_VGGT_REF = os.environ.get("VGGT_REF")
+if _VGGT_REF and _VGGT_REF not in sys.path:
     sys.path.insert(0, _VGGT_REF)
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
-from reference.torch_vggt import load_vggt  # noqa: E402
+from models.demos.vggt.reference.torch_vggt import load_vggt  # noqa: E402
 from vggt.utils.load_fn import load_and_preprocess_images  # noqa: E402
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri  # noqa: E402
 
@@ -365,7 +366,8 @@ def eval_scene(category: str, seq_name: str, seq_anns: list,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--co3d-root", type=Path, default=Path("/home/ttuser/experiments/vggt/co3d_data"))
+    ap.add_argument("--co3d-root", type=Path,
+                    default=Path(os.environ.get("VGGT_CO3D_ROOT", "co3d_data")))
     ap.add_argument("--category", default="apple",
                     help="Single category. Ignored if --categories is given.")
     ap.add_argument("--categories", default="",
@@ -373,8 +375,9 @@ def main():
     ap.add_argument("--seqs", default="",
                     help="Comma-separated sequence names. Empty = all in each category.")
     ap.add_argument("--num-views", type=int, default=8)
-    ap.add_argument("--device-id", type=int, default=2,
-                    help="Pinned to chip 2 on the shared 4-chip host by default.")
+    ap.add_argument("--device-id", type=int,
+                    default=int(os.environ.get("TT_DEVICE_ID", "0")),
+                    help="Tenstorrent UMD chip id (default: $TT_DEVICE_ID or 0).")
     ap.add_argument("--prewarm-seqs", default="",
                     help="Comma-separated S values to pre-warm at install. "
                          "Default: --num-views.")
@@ -390,8 +393,10 @@ def main():
     # install-preloaded instance), so a fresh VGGT falls through to the
     # original forward automatically.
     import ttnn
-    from tt.ttnn_vggt import vggt_forward, _ensure_installed
-    device = ttnn.open_device(device_id=args.device_id, l1_small_size=32 * 1024)
+    from models.demos.vggt.tt.ttnn_vggt import vggt_forward, _ensure_installed
+    from models.demos.vggt.tt.ttnn_vggt import trace_region_bytes as _trace_bytes, l1_small_bytes as _l1_small
+    _trace_kw = {"trace_region_size": _trace_bytes()} if _trace_bytes() else {}  # TT_FUSED=1 only
+    device = ttnn.open_device(device_id=args.device_id, l1_small_size=_l1_small(), **_trace_kw)  # 32 KiB unless TT_FUSED=1
     if hasattr(device, "enable_program_cache"):
         device.enable_program_cache()
 

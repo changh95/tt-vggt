@@ -5,7 +5,7 @@
 # bandwidth, and a Tracy GUI-compatible dump.
 #
 # Output lands under
-#   /home/ttuser/experiments/medgemma/tt-metal/generated/profiler/reports/
+#   $TT_METAL_HOME/generated/profiler/reports/
 # with a timestamped directory containing ops_perf_results_*.csv +
 # raw Tracy .tracy file.
 #
@@ -17,7 +17,10 @@
 #                 run is enough for the op breakdown).
 set -euo pipefail
 
-TT_ROOT=/home/ttuser/experiments/medgemma/tt-metal
+# TT_METAL_HOME must point at a Tracy-enabled tt-metal build; VGGT_REF at the
+# pinned facebookresearch/vggt checkout if it is not already on PYTHONPATH.
+TT_ROOT="${TT_METAL_HOME:?set TT_METAL_HOME to a Tracy-enabled tt-metal tree}"
+CODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${TT_ROOT}"
 
 SEQ="${PROFILE_SEQ:-1}"
@@ -28,7 +31,7 @@ NAME="vggt_s${SEQ}_$(date +%Y%m%d_%H%M%S)"
 # via a .pth file in site-packages. python3 -m tracy would pick that up
 # and fail with "TT_METAL_DEVICE_PROFILER requires a Tracy-enabled build".
 # Force medgemma's tree (Tracy-ON) first on PYTHONPATH and TT_METAL_HOME.
-export PYTHONPATH="${TT_ROOT}:${TT_ROOT}/ttnn:${TT_ROOT}/tools:${PYTHONPATH:-}"
+export PYTHONPATH="${CODE_DIR}:${VGGT_REF:+${VGGT_REF}:}${TT_ROOT}:${TT_ROOT}/ttnn:${TT_ROOT}/tools:${PYTHONPATH:-}"
 export TT_METAL_HOME="${TT_ROOT}"
 
 # -r = generate ops report (CSV with per-op device time).
@@ -45,5 +48,5 @@ exec python3 -m tracy \
     -r \
     --sync-host-device \
     -n "${NAME}" \
-    /home/ttuser/experiments/vggt/test_vggt.py \
-    --seq "${SEQ}" --runs "${RUNS}" --device-id 2
+    "${CODE_DIR}/test_vggt.py" \
+    --seq "${SEQ}" --runs "${RUNS}" --device-id "${TT_DEVICE_ID:-0}"

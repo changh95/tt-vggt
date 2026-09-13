@@ -32,3 +32,14 @@ bae1d6059e	0.6097	99.5700	keep	2D RoPE on device (cos/sin tables precomputed, ap
 db0ff6a28c	0.6104	99.5900	keep	DPT output_conv2 (3x3+relu+1x1 at 518x518) on ttnn.conv2d - break-even speed, moves ~454 ms of CPU work to device
 db0ff6a	0.5276	99.6000	discard	per-conv wrapper for DPT scratch — 1640->1895 ms (per-conv up/down roundtrip x 120 calls eats compute)
 2b2bf2d	0.7053	-7.5400	discard	device-native scratch_forward — PCC broken (-0.08); layout/add mismatch between conv2d chained outputs; needs careful mast3r-style layout debugging
+5d6d729	2.6954	99.3500	keep	TT_FUSED=1 device-resident TtVggt + one metal trace per S (B1/B2/B3/B4/B5/B7/B13) after the first p150a fixes (rotary padded-row shape, interp/gather batch-broadcast hang) - 1322->371 ms eager S=1, PCC 0.9935 (legacy 0.9950 on this tree)
+f37f89f	2.6954	99.3500	keep	DPT heads per frame (batched 518^2 conv needs DRAM op-slicing at S>=2: not trace-capturable, hung the chip eagerly with a live trace); VGGT_L1_SMALL_KB; 4 traces live S=1..4 - S=2 803 ms (legacy 2314), S=4 2618 (5748)
+0690ca1	2.2321	99.5200	keep	VGGT_FUSED_INTERP=exact: 0/1 bf16 gathers of a bf16 hi/lo split + fp32 eltwise weights (the fp32 x fp32 matmul rounds tf32-class) - S=1 448 ms, PCC 0.9952 = host fp32 interpolation; rep 371 ms / 0.9935 kept as opt-in
+0690ca1	3.1250	99.7900	discard	VGGT_FUSED_ATTN=sdpa (B10) - S=1 243 ms / 0.9957, S=4 980 ms / 0.9973 synthetic, but 7-scene real-image set 0.99793 mean (legacy 0.99903; depth_conf -0.0027 on the KITTI S=3 scene) - knob only
+0690ca1	2.6882	99.8400	discard	VGGT_FUSED_MATMUL=minimal (B8) - S=1 372 ms (no gain), PCC 0.9984 synthetic, real-image set +-0.0001 vs default - knob only
+0690ca1	1.7133	99.5200	discard	VGGT_FUSED_CAMERA=host - 584 ms (readback + torch camera head), pose_enc identical - device camera head kept
+f37f89f	0.0000	99.8700	discard	VGGT_FUSED_SOFTMAX=inplace/scale_mask at S=3 (B11): no hang at N=4122, PCC 0.9987, 1553 ms eager vs 1719 traced default - superseded by SDPA for speed, kept as knobs
+f37f89f	2.6882	99.3700	discard	VGGT_FUSED_LN32=eltwise (fp32 eltwise LayerNorm for the DINOv2 output; the fp32 layer_norm kernel is bf16-class) - +0.0002 PCC, +1 ms - opt-in
+f37f89f	2.6738	99.1600	discard	VGGT_FUSED_PRELUDE=fp32 (fp32 DPT prelude) - PCC 0.9916 (worse than bf16 0.9935)
+2c31bd3	2.4631	99.5200	keep	VGGT_FUSED_RESHAPE=rm: upsample relayouts as untilize -> RM view -> tilize (6-7 ms -> 1.5 ms each at 518^2), bit-identical - S=1 448->406 ms, S=2 953->874, S=4 2909->2759
+3b98d5c	2.4631	99.5200	keep	TT_FUSED default ON (TT_FUSED=0 = legacy path); served in the shipped image: S=1 forward 411 ms median (legacy 1602), S=2 881 (2887), smoke PASS, clean stop
