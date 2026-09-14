@@ -31,20 +31,51 @@ legacy column above is the same code re-measured on the validation host.
 
 ## Demos
 
-Single-image inference on `vggt_ref/examples/kitchen/images/00.png` via
-`make_demo.py`. Depth map and re-rendered point cloud are both produced
-from the ttnn port's `depth` and `world_points` outputs.
+Two-view reconstruction of the upstream `kitchen` example scene
+(`vggt_ref/examples/kitchen/images/00.png` / `03.png`, 779×520, kept here
+as `media/source_1.png` / `media/source_2.png`) by the **served** traced
+path. `make_demo.py` posts the pair to a running server's `POST /predict`
+(the same request any client sends; each frame is resized to a 518 long
+side and white-padded to 518×518 server-side), decodes the npz response
+and renders the union of both views' `world_points` — VGGT predicts every
+view's points in the camera-1 frame — coloured by the source pixels,
+filtered at `world_points_conf` ≥ 1.5, from two virtual viewpoints.
 
-| input | predicted depth | point cloud, rendered from a new angle |
+| view 1 | view 2 | fused point map (camera-1 frame, two viewpoints) |
 |---|---|---|
-| ![input](media/input.png) | ![depth](media/depth.png) | ![point cloud](media/point_cloud_reprojected.png) |
+| ![view 1](media/source_1.png) | ![view 2](media/source_2.png) | ![point map](media/pointmap.png) |
 
-Reproduce with (paths: see *How to reproduce*):
+Numbers printed by `make_demo.py` for this pair (served, `TT_FUSED=1`,
+2026-09-14; the rendered figure is reproduced byte for byte from the saved
+response with `--from-response`):
+
+| | |
+|---|---|
+| server timing (S=2, one request) | preprocess 48 ms · forward 933 ms · npz encode 207 ms · total 1188 ms |
+| points kept (conf ≥ 1.5), view 1 / view 2 | 125 109 / 164 601 (260 000 drawn) |
+| predicted camera 2 relative to camera 1 | rotation 47.0°, baseline 0.84 (VGGT's normalised scene units) |
+| cross-view consistency (view-2 points projected into camera 1 vs view-1 depth) | 89 % land inside camera 1's frustum; median relative depth difference 0.85 %, 79 % of points within 10 % |
+
+The consistency row is the demo's coherence check: two unrelated sheets
+would give an O(1) median depth difference, one fused scene gives a few
+percent. Reproduce against a running server (client side needs only
+numpy + pillow + matplotlib). In this repo `make_demo.py` sits at the root
+rather than under `code/`, so pass the media paths explicitly:
 
 ```bash
-TT_METAL_HOME=/path/to/tt-metal VGGT_REF=$PWD/vggt_ref python3 make_demo.py
-# TT_FUSED=0 renders the same demo through the legacy path.
+python3 make_demo.py media/source_1.png media/source_2.png \
+    --url http://127.0.0.1:20000 --out media/pointmap.png --save-response out.json
+python3 make_demo.py media/source_1.png media/source_2.png \
+    --from-response out.json --out media/pointmap.png          # re-render offline
+TT_METAL_HOME=/path/to/tt-metal VGGT_REF=$PWD/vggt_ref \
+    python3 make_demo.py media/source_1.png media/source_2.png --local --out media/pointmap.png
+# --local opens the device directly (no server); TT_FUSED=0 selects the legacy path there (not re-rendered for this change).
 ```
+
+`--metrics out_metrics.json` writes the printed numbers as JSON. The
+previous single-view demo (`media/depth.png`, `media/point_cloud_reprojected.png`)
+was removed with this change; `media/input.png` (kitchen frame 00, 518×518)
+stays as the single-frame smoke/quick-start input.
 
 ## Repository layout
 
@@ -57,9 +88,9 @@ tt-vggt/
 ├── results.tsv              # one row per experiment (legacy trajectory + traced-path A/Bs)
 ├── test_vggt.py             # perf benchmark harness (B=1, S=1..4)
 ├── eval_vggt.py             # CO3Dv2 correctness harness (PCC + GT pose)
-├── make_demo.py             # populates media/ with input + depth + point cloud
+├── make_demo.py             # two-view point-map demo (served npz, --from-response, or --local) -> media/pointmap.png
 ├── profile_tracy.sh         # Tracy op profile of test_vggt.py
-├── media/                   # demo input + output images
+├── media/                   # demo inputs (source_1/2.png, input.png) + pointmap.png
 └── models/
     ├── demos/vggt/
     │   ├── reference/torch_vggt.py    # loader over facebookresearch/vggt
