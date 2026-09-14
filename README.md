@@ -422,6 +422,23 @@ Full backlog is in `TODO.md`. Highlights:
   layout-handling pattern reference
   (`/home/ttuser/experiments/mast3r/tt-metal/models/demos/mast3r/`).
 
+## Comparison with an RTX 5090 (same host, 2026-09-14)
+
+multi-view forward, 518×518; S=1 / S=2; ratio = p150a ms / GPU ms.
+
+| setting | ms | vs p150a |
+|---|---:|---|
+| p150a, bf16 fused trace per S (served `timing_ms.forward`) | 420 / 887 | — |
+| RTX 5090 fp32 strict | 134 / 245 | GPU 3.1× / 3.6× |
+| RTX 5090 bf16 autocast | 65.6 / 103.4 | GPU 6.4× / 8.6× |
+| RTX 5090 fp16 autocast | 63.3 / 95.7 | GPU 6.6× / 9.3× |
+| RTX 5090 fp16 weights resident (eager) | 52.3 / 76.8 | GPU 8.0× / 11.6× |
+| RTX 5090 + `torch.compile` | slower than eager | — |
+
+The 1B-parameter aggregator is compute-bound on the p150a (one metal-trace per S, no host syncs); the gap reflects raw throughput.
+
+Methodology: same host, this repo's torch reference (same weights and preprocessing as the served p150a path) run eagerly in PyTorch 2.11 cu128 (fp32 weights + `torch.autocast` unless stated; no TensorRT), batch 1, medians of 50 iterations after warm-up, H2D/D2H included; GPU fp32 output matches the CPU fp32 reference (PCC 1.0). p150a rows are the served bf16 fused path incl. upload/readback. p150a power was not measured, so no efficiency comparison is made. Full per-precision table, power and memory: [`GPU_COMPARISON.md`](GPU_COMPARISON.md).
+
 ## License
 
 Apache 2.0 — same as upstream VGGT and tt-metal.
